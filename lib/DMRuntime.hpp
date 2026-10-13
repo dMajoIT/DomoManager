@@ -42,6 +42,326 @@ struct DiagnosticConfig;
 
 void mySplitCallback(const SplitOutManager::Split& s, bool isStart);
 
+// ========================================================================
+// PHYSICAL IO MANAGER
+//
+// Gestisce:
+//   - scansione periodica degli ingressi
+//   - debounce non bloccante
+//   - pubblicazione degli eventi di ingresso
+//   - comando delle uscite dagli eventi del bus centrale
+//
+// Non accede direttamente al buffer per aggiornare gli ingressi.
+// Il buffer viene aggiornato dal consumer centrale degli eventi.
+// ========================================================================
+
+class PhysicalIOManager
+{
+private:
+
+    struct InputState
+    {
+        DomoManagerConfig::LocalIO::Input config;
+
+        bool initialized = false;
+        bool lastReading = false;
+        uint32_t changedAt = 0;
+
+        bool published = false;
+        bool publishedValue = false;
+    };
+
+    std::vector<InputState> inputs;
+
+    std::vector<DomoManagerConfig::LocalIO::Output> outputs;
+
+    EventManager* events = nullptr;
+
+    uint8_t inputSourceId =
+        EventManager::INVALID_CONSUMER_ID;
+
+    uint16_t pollingMs = 10;
+
+    uint32_t lastScan = 0;
+    bool scanStarted = false;
+
+
+public:
+
+    // ====================================================================
+    // BEGIN
+    // ====================================================================
+
+    bool begin(
+        const DomoManagerConfig::LocalIO& cfg,
+        EventManager& eventManager,
+        Buffer& buffer,
+        uint8_t sourceId)
+    {
+        inputs.clear();
+        outputs.clear();
+
+        events = &eventManager;
+        inputSourceId = sourceId;
+
+        pollingMs = cfg.pollingMs == 0
+            ? 1
+            : cfg.pollingMs;
+
+        scanStarted = false;
+
+        // Inizializza l'hardware della piattaforma.
+        // Questo punto deve essere l'unico responsabile
+        // dell'inizializzazione DMPlatform nel runtime.
+        DMPlatform::SetupPlatformIO();
+
+        // ------------------------------------------------------------
+        // INPUTS
+        // ------------------------------------------------------------
+
+        for (const auto& input : cfg.inputs)
+        {
+            if (!DMPlatform::IsPinAvailable(input.pin))
+                continue;
+
+            // Il pulsante USER rimane responsabilità di FrontendRuntime.
+            if (input.pin == DMPlatform::UserButton)
+            {
+                LOG_WF(
+                    "PhysicalIO",
+                    "Pulsante USER escluso dagli ingressi locali"
+                );
+                continue;
+            }
+
+            if (input.area < 0 ||
+                static_cast<size_t>(input.area) >= buffer.size())
+            {
+                LOG_EF(
+                    "PhysicalIO",
+                    "Area ingresso non valida: pin=%d area=%d bufferSize=%u",
+                    input.pin,
+                    input.area,
+                    static_cast<unsigned>(buffer.size())
+                );
+
+                return false;
+            }
+
+            DMPlatform::SetupInputPin(input.pin);
+
+            InputState state;
+            state.config = input;
+
+            inputs.push_back(state);
+        }
+
+        // ------------------------------------------------------------
+        // OUTPUTS
+        // ------------------------------------------------------------
+
+        for (const auto& output : cfg.outputs)
+        {
+            if (!DMPlatform::IsPinAvailable(output.pin))
+                continue;
+
+            if (output.area < 0 ||
+                static_cast<size_t>(output.area) >= buffer.size())
+            {
+                LOG_EF(
+                    "PhysicalIO",
+                    "Area uscita non valida: pin=%d area=%d bufferSize=%u",
+                    output.pin,
+                    output.area,
+                    static_cast<unsigned>(buffer.size())
+                );
+
+                return false;
+            }
+
+            DMPlatform::SetupOutputPin(output.pin);
+
+            outputs.push_back(output);
+        }
+
+        LOG_IF(
+            "PhysicalIO",
+            "Inizializzati: ingressi=%u uscite=%u polling=%u ms",
+            static_cast<unsigned>(inputs.size()),
+            static_cast<unsigned>(outputs.size()),
+            static_cast<unsigned>(pollingMs)
+        );
+
+        return true;
+    }
+
+
+    // ====================================================================
+    // UPDATE INPUTS
+    //
+    // Chiamato dal ciclo di DMRuntime.
+    // ====================================================================
+
+    void update(unsigned long now)
+    {
+        if (!events || inputs.empty())
+            return;
+
+        const uint32_t timestamp =
+            static_cast<uint32_t>(now);
+
+        if (scanStarted &&
+            static_cast<uint32_t>(timestamp - lastScan) < pollingMs)
+        {
+            return;
+        }
+
+        scanStarted = true;
+        lastScan = timestamp;
+
+        for (auto& input : inputs)
+        {
+            const auto& cfg = input.config;
+
+            const bool reading =
+                !DMPlatform::ReadInputPin(cfg.pin);
+
+            // --------------------------------------------------------
+            // ACQUISIZIONE FISICA
+            // --------------------------------------------------------
+
+            if (!input.initialized)
+            {
+                input.initialized = true;
+                input.lastReading = reading;
+                input.changedAt = timestamp;
+            }
+            else if (reading != input.lastReading)
+            {
+                input.lastReading = reading;
+                input.changedAt = timestamp;
+            }
+
+            // --------------------------------------------------------
+            // DEBOUNCE
+            // --------------------------------------------------------
+
+            if (static_cast<uint32_t>(
+                    timestamp - input.changedAt) < cfg.debounceMs)
+            {
+                continue;
+            }
+
+            // --------------------------------------------------------
+            // NESSUNA VARIAZIONE DA PUBBLICARE
+            // --------------------------------------------------------
+
+            if (input.published &&
+                input.publishedValue == input.lastReading)
+            {
+                continue;
+            }
+
+            // --------------------------------------------------------
+            // PREPARA EVENTO
+            // --------------------------------------------------------
+
+            const bool newValue = input.lastReading;
+
+            const int oldValue =
+                input.published
+                    ? (input.publishedValue ? 1 : 0)
+                    : -1;
+
+            // --------------------------------------------------------
+            // PUSH EVENTMANAGER
+            // --------------------------------------------------------
+
+            const uint32_t eventId = events->push(
+                cfg.area,
+                newValue ? 1L : 0L,
+                inputSourceId
+            );
+
+            // --------------------------------------------------------
+            // PUSH FALLITA
+            // FIFO piena: non aggiornare lo stato pubblicato.
+            // Il prossimo ciclo riproverà.
+            // --------------------------------------------------------
+
+            if (eventId == 0)
+                continue;
+
+            // --------------------------------------------------------
+            // LOG SOLO DOPO PUSH RIUSCITA
+            // --------------------------------------------------------
+
+            LOG_IF(
+                "PhysicalIO",
+                "INPUT PUSH: pin=%d area=%d old=%d new=%d source=%u eventId=%lu",
+                cfg.pin,
+                cfg.area,
+                oldValue,
+                newValue ? 1 : 0,
+                static_cast<unsigned>(inputSourceId),
+                static_cast<unsigned long>(eventId)
+            );
+
+            // --------------------------------------------------------
+            // AGGIORNA STATO PUBBLICATO
+            // --------------------------------------------------------
+
+            input.published = true;
+            input.publishedValue = newValue;
+        }
+    }
+
+
+    // ====================================================================
+    // OUTPUT EVENT HANDLER
+    // ====================================================================
+
+    void onEvent(const EventManager::Event& event)
+    {
+        // Gli eventi grezzi degli ingressi non sono comandi di uscita.
+        // Eventuali comandi derivati da route o automazioni hanno
+        // una source diversa e vengono elaborati normalmente.
+        if (event.source == inputSourceId)
+            return;
+
+        for (const auto& output : outputs)
+        {
+            if (event.area != output.area)
+                continue;
+
+            DMPlatform::WriteOutputPin(
+                output.pin,
+                event.value != 0
+            );
+        }
+    }
+
+
+    // ====================================================================
+    // STATUS
+    // ====================================================================
+
+    size_t getInputCount() const
+    {
+        return inputs.size();
+    }
+
+    size_t getOutputCount() const
+    {
+        return outputs.size();
+    }
+
+    uint8_t getInputSourceId() const
+    {
+        return inputSourceId;
+    }
+};
+
 class Logic {
 private:
     ToggleManager toggles;
@@ -108,6 +428,168 @@ public:
     void printAll(DomoManager& manager);
 };
 
+class DeviceErrorMap
+{
+private:
+    DeviceManager& deviceManager;
+    std::vector<GenericPrgDevice*> areaDevices;
+    std::vector<uint8_t> areaErrors;
+
+public:
+    using AreaErrorChangedCallback = void (*)(int area);
+
+    explicit DeviceErrorMap(DeviceManager& dm) : deviceManager(dm) {}
+
+    void build()
+    {
+        auto& devices=deviceManager.getDevices();
+        int maxArea=-1;
+
+        for(auto& dev:devices)
+        {
+            const int channels=static_cast<int>(dev.GetChannelsSize());
+            for(int ch=0;ch<channels;++ch)
+            {
+                const auto info=dev.GetChannelInfo(ch);
+                for(int i=0;i<info.items;++i)
+                {
+                    const int area=dev.GetArea(ch,i);
+                    if(area>maxArea) maxArea=area;
+                }
+            }
+        }
+
+        if(maxArea<0)
+        {
+            areaDevices.clear();
+            areaErrors.clear();
+            return;
+        }
+
+        areaDevices.assign(static_cast<size_t>(maxArea+1),nullptr);
+        areaErrors.assign(areaDevices.size(),0);
+
+        for(auto& dev:devices)
+        {
+            const int channels=static_cast<int>(dev.GetChannelsSize());
+            for(int ch=0;ch<channels;++ch)
+            {
+                const auto info=dev.GetChannelInfo(ch);
+                for(int i=0;i<info.items;++i)
+                {
+                    const int area=dev.GetArea(ch,i);
+                    if(area<0) continue;
+
+                    const size_t index=static_cast<size_t>(area);
+                    if(index>=areaDevices.size()) continue;
+
+                    if(!areaDevices[index])
+                        areaDevices[index]=&dev;
+                    else if(areaDevices[index]!=&dev)
+                        LOG_EF(
+                            "DeviceErrorMap",
+                            "DUPLICATE AREA=%d existingDev=%p newDev=%p",
+                            area,
+                            (void*)areaDevices[index],
+                            (void*)&dev
+                        );
+                }
+            }
+        }
+
+        for(size_t area=0;area<areaDevices.size();++area)
+        {
+            auto* dev=areaDevices[area];
+            if(!dev) continue;
+
+            areaErrors[area]=(
+                dev->GetError().IsVisibleError() ||
+                dev->GetError().IsVisibleParked()
+            ) ? 1 : 0;
+        }
+    }
+
+    void onDeviceErrorChanged(
+        GenericPrgDevice& dev,
+        AreaErrorChangedCallback callback)
+    {
+        if(areaDevices.empty())
+        {
+            return;
+        }
+
+        const bool inError =
+            dev.GetError().IsVisibleError() ||
+            dev.GetError().IsVisibleParked();
+
+        const uint8_t newState =
+            inError ? 1 : 0;
+
+        size_t affected = 0;
+        size_t changed = 0;
+
+        for(size_t area=0; area<areaDevices.size(); ++area)
+        {
+            if(areaDevices[area] != &dev)
+                continue;
+
+            ++affected;
+
+            if(areaErrors[area] == newState)
+                continue;
+
+            areaErrors[area] = newState;
+            ++changed;
+
+            if(callback)
+            {
+                callback(
+                    static_cast<int>(area)
+                );
+            }
+        }
+    }
+
+
+
+    bool isAreaInError(int area) const
+    {
+        if(area<0)
+            return false;
+
+        const size_t index=static_cast<size_t>(area);
+
+        if(index>=areaErrors.size())
+            return false;
+
+        return areaErrors[index]!=0;
+    }
+
+    GenericPrgDevice* getDeviceForArea(int area) const
+    {
+        if(area<0)
+            return nullptr;
+
+        const size_t index=static_cast<size_t>(area);
+
+        if(index>=areaDevices.size())
+            return nullptr;
+
+        return areaDevices[index];
+    }
+
+    bool hasDevice(int area) const
+    {
+        return getDeviceForArea(area)!=nullptr;
+    }
+
+    size_t size() const
+    {
+        return areaDevices.size();
+    }
+};
+
+
 class DMRuntime {
 public:
     using ActivityLoopFn = void (*)(DomoManager&, unsigned long);
@@ -120,6 +602,10 @@ public:
     };
 
 private:
+    using SecurityAreaErrorCallback = void (*)(int area);
+    SecurityAreaErrorCallback securityAreaErrorCallback=nullptr;
+
+    DeviceErrorMap deviceErrorMap;
     DomoManager& manager;
     TimeManager& timeManager;
     DeviceManager& deviceManager;
@@ -135,6 +621,7 @@ private:
     const int areaRunningT;
 
     EventManager eventManager;
+    PhysicalIOManager physicalIO;
 
     class InternalEventPublisher
     {
@@ -242,6 +729,10 @@ private:
     static int routeSource;
     static int automationSource;
 
+    // Nuove source locali.
+    static int physicalIOInputSource;
+    static int physicalIOOutputConsumer;
+
     template<typename Fn>
     unsigned long Measure(Fn f) {
         const unsigned long start = timeManager.nowMs();
@@ -249,6 +740,7 @@ private:
         return timeManager.nowMs() - start;
     }
 
+    
     void UpdateTiming(Watchdog::ExecTiming& t, unsigned long exec, int thresholdFactor_fp) {
         constexpr int SPIKE_READ_INTERVAL = 5000;
         t.last = exec;
@@ -650,10 +1142,17 @@ private:
     static void ModbusRtuEventCallback(const EventManager::Event& event) {
         if (!instance)
             return;
+
+        // Gestisce esclusivamente gli eventi Modbus RTU.
+        if (event.source != modbusRtuSource)
+            return;
+
         const unsigned long now = instance->timeManager.nowMs();
+        
         LOG_DF("ModbusRtuEvent",
                "HMI EVENT -> RTU: id=%lu area=%d value=%ld source=%u",
                (unsigned long)event.id, event.area, event.value, event.source);
+        
         instance->buffer.WriteElement(event.area, event.value, now);
     }
 
@@ -661,11 +1160,15 @@ private:
         const EventManager::Event& event)
     {
         if (!instance)
-        return;
+            return;
 
         // Il Toggle reagisce esclusivamente agli ingressi Modbus.
-        if (event.source != modbusRtuSource)
+        // Toggle reagisce agli ingressi Modbus e agli ingressi fisici.
+        if (event.source != modbusRtuSource &&
+            event.source != physicalIOInputSource)
+        {
             return;
+        }
 
         // Le aree riservate al sistema non entrano nella logica Toggle.
         if (DeviceManager::IsReservedArea(event.area))
@@ -724,8 +1227,6 @@ private:
             result.value,
             static_cast<uint8_t>(toggleSource));
     }
-
-
 
     static void SplitEventCallback(const EventManager::Event& event) {
         if (!instance)
@@ -799,12 +1300,11 @@ private:
         // essere eseguito.
         // ============================================================
 
-        if (event.source == modbusRtuSource)
+        if (event.source == modbusRtuSource ||
+            event.source == physicalIOInputSource)
         {
             if (toggles.handlesArea(event.area))
-            {
                 return;
-            }
         }
 
         // ============================================================
@@ -840,6 +1340,51 @@ private:
             instance->forceEvent(action.targetArea, action.value,
                                  static_cast<uint8_t>(automationSource));
         }
+    }
+
+    // ========================================================================
+    // PHYSICAL IO INPUT SOURCE
+    // ========================================================================
+
+    static void PhysicalIOInputSourceCallback(
+        const EventManager::Event& event)
+    {
+        if (!instance)
+            return;
+
+        // Gestisce esclusivamente gli ingressi fisici.
+        if (event.source != physicalIOInputSource)
+            return;
+
+        const unsigned long now =
+            instance->timeManager.nowMs();
+
+        LOG_DF(
+            "PhysicalIO",
+            "PHYSICAL INPUT: id=%lu area=%d value=%ld source=%u",
+            static_cast<unsigned long>(event.id),
+            event.area,
+            event.value,
+            static_cast<unsigned>(event.source));
+
+        instance->buffer.WriteElement(
+            event.area,
+            event.value,
+            now);
+    }
+
+
+    // ========================================================================
+    // PHYSICAL IO OUTPUT CONSUMER
+    // ========================================================================
+
+    static void PhysicalIOOutputEventCallback(
+        const EventManager::Event& event)
+    {
+        if (!instance)
+            return;
+
+        instance->physicalIO.onEvent(event);
     }
 
     bool validateAutomationConfig() {
@@ -978,8 +1523,11 @@ public:
           leds(led),
           profiles(prof),
           config(cfg),
+
           areaErrors(DeviceManager::AREA_SYSTEM_ERRORS),
           areaRunningT(DeviceManager::AREA_SYSTEM_RUNNING_T),
+          deviceErrorMap(dm),
+
           eventManager(),
           internalEvents(buffer, eventManager),
           logic(mySplitCallback),
@@ -997,6 +1545,7 @@ public:
           activityPrepareReady(false),
           backendCycleDone(false),
           backend1StCycleDone(false) {
+
         timings.somethingChanged.name = "somethingChanged";
         timings.route.name = "route";
         timings.activityLoop.name = "activityLoop";
@@ -1004,40 +1553,148 @@ public:
         instance = this;
     }
 
+    static DMRuntime* GetInstance()
+    {
+        return instance;
+    }
+
     void setCallbacks(SomethingChangedFn changed, ActivityLoopFn activity) {
         somethingChanged = changed;
         activityLoop = activity;
     }
 
-    bool begin() {
+    void SetSecurityAreaErrorCallback(SecurityAreaErrorCallback callback)
+    {
+        securityAreaErrorCallback=callback;
+    }
+
+    bool begin()
+    {
         instance = this;
+
+        // ---------------------------------------------------------
+        // Device -> Area error map
+        // ---------------------------------------------------------
+        deviceErrorMap.build();
+
+        // ---------------------------------------------------------
+        // Modbus read buffer
+        // ---------------------------------------------------------
         mbReadBuffer.resize(deviceManager.GetMaxReadSize());
 
-        modbusRtuSource = eventManager.add(ModbusRtuEventCallback, "MODBUS_RTU");
-        toggleSource = eventManager.add(ToggleEventCallback, "TOGGLE");
-        splitSource = eventManager.add(SplitEventCallback, "SPLIT");
-        routeSource = eventManager.add(RouteEventCallback, "ROUTE");
-        automationSource = eventManager.add(AutomationEventCallback, "AUTOMATION");
+        // ---------------------------------------------------------
+        // Event sources
+        // ---------------------------------------------------------
+        modbusRtuSource = eventManager.add(
+            ModbusRtuEventCallback,
+            "MODBUS_RTU");
+
+       // ---------------------------------------------------------
+        // Physical IO event source e output consumer
+        // ---------------------------------------------------------
+
+        physicalIOInputSource = eventManager.add(
+            PhysicalIOInputSourceCallback,
+            "PHYSICAL_IO_INPUT",
+            -1
+        );
+
+        physicalIOOutputConsumer = eventManager.add(
+            PhysicalIOOutputEventCallback,
+            "PHYSICAL_IO_OUTPUT",
+            -1
+        );
+
+        toggleSource = eventManager.add(
+            ToggleEventCallback,
+            "TOGGLE");
+
+        splitSource = eventManager.add(
+            SplitEventCallback,
+            "SPLIT");
+
+        routeSource = eventManager.add(
+            RouteEventCallback,
+            "ROUTE");
+
+        automationSource = eventManager.add(
+            AutomationEventCallback,
+            "AUTOMATION");
+
+        
+
         internalEvents.attach();
 
-        if (modbusRtuSource == 255 || toggleSource == 255 || splitSource == 255 ||
-            routeSource == 255 || automationSource == 255)
+        if (modbusRtuSource == 255 ||
+            toggleSource == 255 ||
+            splitSource == 255 ||
+            routeSource == 255 ||
+            automationSource == 255 ||
+            physicalIOInputSource == 255 ||
+            physicalIOOutputConsumer == 255)
+        {
+            LOG_EF(
+                "DM",
+                "Impossibile registrare una o più source EventManager"
+            );
+
             return false;
+        }
 
+        // ---------------------------------------------------------
+        // Physical IO initialization
+        // ---------------------------------------------------------
+
+        if (!physicalIO.begin(
+                config.localIO,
+                eventManager,
+                buffer,
+                static_cast<uint8_t>(physicalIOInputSource)))
+        {
+            LOG_EF(
+                "DM",
+                "Impossibile inizializzare PhysicalIOManager"
+            );
+
+            return false;
+        }
+
+        // ---------------------------------------------------------
+        // Modbus engine
+        // ---------------------------------------------------------
         logic.getModbus().Begin(
-            leds, buffer, deviceManager.getDevices(), ipManager,
-            logic.getThresholds(), &SomethingChangedNotify, net,
+            leds,
+            buffer,
+            deviceManager.getDevices(),
+            ipManager,
+            logic.getThresholds(),
+            &SomethingChangedNotify,
+            net,
             networkProtocolId);
-        logic.getModbus().setReadAreaPolicy(&ReadAreaPolicy);
-        logic.getModbus().setFieldChangedCallback(OnModbusFieldChanged);
 
-        automation.attachScheduler(&scheduler, &buffer, &averages, &timeManager);
+        logic.getModbus().setReadAreaPolicy(
+            &ReadAreaPolicy);
+
+        logic.getModbus().setFieldChangedCallback(
+            OnModbusFieldChanged);
+
+        // ---------------------------------------------------------
+        // Automation
+        // ---------------------------------------------------------
+        automation.attachScheduler(
+            &scheduler,
+            &buffer,
+            &averages,
+            &timeManager);
 
         return true;
     }
 
     void loop(ModbusTCPClient& client) {
         const unsigned long now = timeManager.nowMs();
+
+        // Acquisizione periodica degli ingressi fisici.
+        physicalIO.update(now);
 
         if (networkProtocolId >= 0) {
             Update(client, now);
@@ -1144,6 +1801,20 @@ public:
         return automationConfig;
     }
 
+    //Gestione schede in errore per intrusione
+    void onDeviceErrorChanged(GenericPrgDevice& dev)
+    {
+        deviceErrorMap.onDeviceErrorChanged(
+            dev,
+            securityAreaErrorCallback
+        );
+    }
+
+    bool isAreaInError(int area) const
+    {
+        return deviceErrorMap.isAreaInError(area);
+    }
+
     DiagnosticWatchAreas& getWatchDiag() { return watchDiag; }
     AutomationEngine& getAutomation() { return automation; }
     AsyncScheduler& getScheduler() { return scheduler; }
@@ -1189,7 +1860,8 @@ inline int DMRuntime::toggleSource = 255;
 inline int DMRuntime::splitSource = 255;
 inline int DMRuntime::routeSource = 255;
 inline int DMRuntime::automationSource = 255;
-
+inline int DMRuntime::physicalIOInputSource = 255;
+inline int DMRuntime::physicalIOOutputConsumer = 255;
 
 
 

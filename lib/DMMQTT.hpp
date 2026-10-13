@@ -605,7 +605,7 @@ public:
                 sizeof(payload)
             );
 
-            LOG_EF(
+            LOG_IF(
                 "MQTT",
                 "Z2M TX topic=%s payload=%s",
                 topic,

@@ -15,7 +15,6 @@
 
    ============================================================================ */
 
-#include <ArduinoModbus.h>
 #include <vector>
 #include <unordered_map>
 
@@ -24,6 +23,7 @@
 #include "DMSignal.hpp"
 #include "DMBaseClassCore.hpp"
 #include "DMEthernet.hpp"
+#include "DMPlatformModbus.hpp"
 
 #define LOG_LEVEL LogLevel::INFO
 #include "DMLogger.hpp"
@@ -91,8 +91,8 @@ class GenericPrgDevice {
 
     GenericPrgDevice(const char* name, DMIPAddress ip, unsigned int deviceAddress, std::vector<GenericPrgDeviceChannel> channels, std::vector<int> ioAreas, short ErrorCnt, Priority priority);     
     bool Run();
-    structRead Read(ModbusTCPClient &mb, int channel, uint16_t* outBuffer, unsigned long now);
-    bool Write(ModbusClient &mb, int channel, int address, int value, unsigned long now);
+    structRead Read(DMPlatform::Modbus::TCPClient &mb, int channel, uint16_t* outBuffer, unsigned long now);
+    bool Write(DMPlatform::Modbus::TCPClient &mb, int channel, int address, int value, unsigned long now);
     int GetArea(int channel, int address);
     bool FindChannelByArea(int area, int &channel, int &item);
     //GenericPrgDeviceChannel GetChannelInfo(int channel);

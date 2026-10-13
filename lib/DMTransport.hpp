@@ -21,6 +21,8 @@
 #include <functional>
 #include <String>
 
+#include "DMNetwork.hpp"
+
 #define LOG_LEVEL LogLevel::INFO
 #include "DMLogger.hpp"
 

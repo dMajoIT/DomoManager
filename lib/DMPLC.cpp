@@ -226,7 +226,7 @@ bool GenericPrgDevice::FindChannelByArea(int area, int &channel, int &item) {
 }
 
 // I/O Dependent
-GenericPrgDevice::structRead GenericPrgDevice::Read(ModbusTCPClient &cli,
+GenericPrgDevice::structRead GenericPrgDevice::Read(DMPlatform::Modbus::TCPClient &cli,
                                                     int channel,
                                                     uint16_t* outBuffer,
                                                     unsigned long now) {
@@ -372,7 +372,7 @@ GenericPrgDevice::structRead GenericPrgDevice::Read(ModbusTCPClient &cli,
     return retVal;
 }
 
-bool GenericPrgDevice::Write(ModbusClient &mb, int channel, int address, int value, unsigned long now) {
+bool GenericPrgDevice::Write(DMPlatform::Modbus::TCPClient &mb, int channel, int address, int value, unsigned long now) {
   if(this->_channels[channel].type==DO || this->_channels[channel].type==AO) {
     int tmpResult=0;
 

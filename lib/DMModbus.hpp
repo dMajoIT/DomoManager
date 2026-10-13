@@ -15,16 +15,622 @@
 
    ============================================================================ */
 
-#include <ArduinoModbus.h>
+
 #include <Arduino.h>
 
 #include "DMPLC.h"
 #include "DMNetwork.hpp"
 #include "DMBaseClassUtils.hpp"
-
+#include "DMPlatformModbus.hpp"
 
 #define LOG_LEVEL LogLevel::INFO
 #include "DMLogger.hpp"
+
+class IpManager {
+private:
+    class PriorityDeviceCursor {
+    public:
+        int index = -1;
+
+        void init() {
+            if (index < 0)
+                index = 0;
+        }
+
+        void advance(int items) {
+            index++;
+            if (index >= items)
+                index = 0;
+        }
+
+        void save(int deviceIndex) {
+            index = deviceIndex;
+        }
+
+        int get() const {
+            return index;
+        }
+    };
+public:
+    struct Config {
+        unsigned long baseCooldownMs = 5000;      // ex COOLDOWN
+        unsigned long extendedCooldownMs = 120000; // ex IP_COOLDOWN
+        int maxErrorsBeforeCooldown = 2;          // ex MAX_ERRORS
+        int maxErrorsBeforeExclude = 20;          // ex AUTO_EXCLUDE
+        int maxIps = 32;                          // ex array statico 32
+        int maxPriorities = PriorityCount;                    
+    };
+    
+    struct PriorityMgmtEx {
+        PriorityMgmt Base;          // 🔥 contiene Priority + DeviceIndex
+
+        bool Interrupted;           // 🔥 READ interrotta da pacing o write
+        PriorityDeviceCursor Cursor;   // ⭐ cursore per questa priorità
+        
+        PriorityMgmtEx() :
+            Interrupted(false)
+        {
+            Base.deviceIndex = -1;
+            Base.priority = Priority::Normal;
+        }
+    };
+
+    // -------------------------
+    // 1. Stato IP più chiaro
+    // -------------------------
+    enum class IpState {
+        OK,
+        COOLDOWN,
+        EXCLUDED
+    };
+
+    struct structPriority {
+        std::vector<PriorityMgmtEx> Priorities;   // 🔥 usa la versione estesa
+        size_t PrioritySize = 0;
+        int Index = 0;
+
+        structPriority() = default;
+
+        structPriority(int maxPriorities)
+            : Priorities(maxPriorities)
+        {}
+    };
+
+
+    struct structIP {
+        IPAddress IP;
+        int Errors = 0;
+        IpState state = IpState::OK;
+
+        structPriority Priority;
+        int priorityCycleCounter = 0;   // 🔥 nuovo contatore round‑robin perfetto
+
+        unsigned long lastErrorTime = 0;
+        unsigned long cooldown = 0;
+        bool exclude = false;
+        int consecutiveErrors = 0;
+        unsigned long lastCycleDuration = 0;   // 🔥 nuovo campo
+
+        structIP(int maxPriorities, unsigned long baseCooldown)
+            : Priority(maxPriorities),
+            cooldown(baseCooldown)
+        {}
+    };
+
+
+    // -------------------------
+    // LOG INTELLIGENTE
+    // -------------------------
+    void logSkip(int ipIdx, const structIP &ip, unsigned long now) {
+        // Log solo se cambia stato
+        if (lastState[ipIdx] != ip.state) {
+            lastState[ipIdx] = ip.state;
+
+            if (ip.state == IpState::COOLDOWN) {
+                unsigned long remaining =
+                    (ip.lastErrorTime + ip.cooldown > now)
+                    ? (ip.lastErrorTime + ip.cooldown - now)
+                    : 0;
+
+                LOG_WF("IpManager",
+                    "IP %s in COOLDOWN (%lus rimanenti)",
+                    ip.IP.toString().c_str(),
+                    remaining / 1000
+                );
+            }
+            return;
+        }
+
+        // Log periodico ogni 10 secondi
+        if (now - lastCooldownLog[ipIdx] >= 10000) {
+            lastCooldownLog[ipIdx] = now;
+
+            unsigned long remaining =
+                (ip.lastErrorTime + ip.cooldown > now)
+                ? (ip.lastErrorTime + ip.cooldown - now)
+                : 0;
+
+            LOG_DF("IpManager",
+                "Skip IP %s (cooldown %lus)",
+                ip.IP.toString().c_str(),
+                remaining / 1000
+            );
+        }
+    }
+
+    void logRestore(int ipIdx, const structIP &ip) {
+    
+        if (wasInCooldown[ipIdx] && ip.state == IpState::OK) {
+            LOG_IF("IpManager",
+                "IP %s ripristinato",
+                ip.IP.toString().c_str()
+            );
+        }
+
+        wasInCooldown[ipIdx] = (ip.state == IpState::COOLDOWN);
+    }
+
+    IpManager()
+        : config(Config())
+    {
+        initArrays();
+    }
+
+    IpManager(const Config& cfg)
+        : config(cfg)
+    {
+        initArrays();
+    }
+private:
+    std::vector<structIP> IPs;
+    Config config;
+    std::unordered_map<uint32_t, std::vector<int>> devicesByIP;
+
+    // 🔥 Array privati dinamici
+    std::vector<IpState> lastState;
+    std::vector<unsigned long> lastCooldownLog;
+    std::vector<bool> wasInCooldown;
+
+    void initArrays() {
+        lastState.resize(config.maxIps, IpState::OK);
+        lastCooldownLog.resize(config.maxIps, 0);
+        wasInCooldown.resize(config.maxIps, false);
+    }
+
+    // -------------------------
+    // Helpers di stato
+    // -------------------------
+    const char* StateToString(IpState s) const {
+        switch (s) {
+            case IpState::OK: return "OK";
+            case IpState::COOLDOWN: return "COOLDOWN";
+            case IpState::EXCLUDED: return "EXCLUDED";
+        }
+        return "UNKNOWN";
+    }
+
+    bool ExistsIp(IPAddress ip) {
+        for (auto& item : IPs)
+            if (item.IP == ip)
+                return true;
+        return false;
+    }
+
+    int GetUsedPriorities(IPAddress ip,
+                          std::vector<GenericPrgDevice>& prgDevices,
+                          std::vector<PriorityMgmt>& items)
+    {
+        for (auto& prgDevice : prgDevices) {
+            if (prgDevice.GetIp() != ip)
+                continue;
+
+            bool exist = false;
+            for (auto& it : items)
+                if (it.priority == prgDevice.GetPriority())
+                    exist = true;
+
+            if (!exist) {
+                PriorityMgmt tmp;
+                tmp.priority = prgDevice.GetPriority();
+                tmp.deviceIndex = -1;
+                items.push_back(tmp);
+            }
+        }
+        return (int)items.size();
+    }
+
+    static inline uint32_t MakeIpKey(const IPAddress& ip)
+    {
+        return (uint32_t(ip[0]) << 24) |
+            (uint32_t(ip[1]) << 16) |
+            (uint32_t(ip[2]) << 8)  |
+                uint32_t(ip[3]);
+    }
+
+    void BuildDevicesByIP(std::vector<GenericPrgDevice> &prgDevices) {
+        devicesByIP.clear();
+
+        for (int i = 0; i < prgDevices.size(); i++) {
+            uint32_t key = MakeIpKey(prgDevices[i].GetIp());
+
+            devicesByIP[key].push_back(i);
+        }
+    }
+
+    bool HasDevicesForPriority(
+        int ipIdx,
+        Priority prio,
+        const GenericPrgDeviceManager& deviceManager)
+    {
+        const auto& ip = IPs[ipIdx];
+
+        return deviceManager.HasDevicesByPriority(
+            prio,
+            ip.IP
+        );
+    }
+
+    void AdvancePriority(int ipIdx, int items) {
+        auto &p = IPs[ipIdx].Priority;
+
+        LOG_DF("PRIO", 
+            "AdvancePriority(ip=%d) BEFORE: Index=%d DeviceIndex=%d items=%d",
+            ipIdx,
+            p.Index,
+            p.Priorities[p.Index].Base.deviceIndex,
+            items);
+
+        p.Priorities[p.Index].Base.deviceIndex++;
+
+        if (p.Priorities[p.Index].Base.deviceIndex >= items ||
+            p.Priorities[p.Index].Base.deviceIndex < 0)
+        {
+            p.Priorities[p.Index].Base.deviceIndex = 0;
+        }
+
+        if (p.Index >= p.PrioritySize - 1)
+            p.Index = 0;
+        else
+            p.Index++;
+
+        LOG_DF("PRIO", 
+            "AdvancePriority(ip=%d) AFTER: Index=%d DeviceIndex=%d",
+            ipIdx,
+            p.Index,
+            p.Priorities[p.Index].Base.deviceIndex);
+    }
+
+
+public:
+    void setLastCycleDuration(int ipIdx, unsigned long duration) {
+        IPs[ipIdx].lastCycleDuration = duration;
+    }
+
+    unsigned long getLastCycleDuration(int ipIdx) const {
+        return IPs[ipIdx].lastCycleDuration;
+    }
+
+    // -------------------------
+    // Accesso ai device per IP
+    // -------------------------
+    std::vector<int>* GetDevicesByIP(IPAddress &ip) {
+        uint32_t key = MakeIpKey(ip);
+
+        auto it = devicesByIP.find(key);
+        if (it == devicesByIP.end())
+            return nullptr;
+
+        return &it->second;
+    }
+
+    // -------------------------
+    // Costruzione lista IP
+    // -------------------------
+        int BuildIps(std::vector<GenericPrgDevice>& prgDevices) {
+        IPs.clear();
+
+        for (auto& prgDevice : prgDevices) {
+            auto ip = prgDevice.GetIp();
+
+            if (!ExistsIp(ip)) {
+                structIP newItem(config.maxPriorities, config.baseCooldownMs);
+                newItem.IP = ip;
+
+                // Priorità
+                std::vector<PriorityMgmt> tmpPriorities;
+                GetUsedPriorities(ip, prgDevices, tmpPriorities);
+
+                for (size_t j = 0; j < tmpPriorities.size(); j++) {
+                    newItem.Priority.Priorities[j].Base = tmpPriorities[j];
+                    newItem.Priority.Priorities[j].Interrupted = false;
+                }
+                newItem.Priority.PrioritySize = tmpPriorities.size();
+                newItem.Priority.Index = 0;
+                
+                IPs.push_back(newItem);
+            }
+        }
+
+        static bool devicesByIPInitialized = false;
+        if (!devicesByIPInitialized) {
+            BuildDevicesByIP(prgDevices);
+            devicesByIPInitialized = true;
+        }
+
+        return IPs.size();
+    }
+    
+    // -------------------------
+    // Query device per IP
+    // -------------------------
+    bool ExistDevicesByIp(int ipIdx) const
+    {
+        if (ipIdx < 0 || ipIdx >= static_cast<int>(IPs.size()))
+            return false;
+
+        auto ip = IPs[ipIdx].IP;
+        uint32_t key = MakeIpKey(ip);
+        auto it = devicesByIP.find(key);
+
+        return it != devicesByIP.end() && !it->second.empty();
+    }
+
+    std::vector<structIP>& GetIps() { return IPs; }
+    structIP& GetIp(int ipIdx) { return IPs[ipIdx]; }
+
+    // -------------------------
+    // ShouldQuery migliorato
+    // -------------------------
+    bool ShouldQuery(int ipIdx, unsigned long now) {
+        auto &ip = IPs[ipIdx];
+
+        // 1. Escluso manualmente o automaticamente
+        if (ip.state == IpState::EXCLUDED)
+            return false;
+
+        // 2. In cooldown → NON tentare
+        if (ip.state == IpState::COOLDOWN) {
+            // 🔥 log automatico
+            logSkip(ipIdx, ip, now);
+
+            if (now - ip.lastErrorTime >= ip.cooldown) {
+                // 🔥 Fine cooldown → prova UNA volta
+                ip.state = IpState::OK;
+                ip.consecutiveErrors = 0;
+
+                // 🔥 log automatico
+                logRestore(ipIdx, ip);
+                return true;
+            }
+            return false;
+        }
+
+        // 3. Stato OK → interrogabile
+        return true;
+    }
+
+
+    // -------------------------
+    // Gestione errori migliorata
+    // -------------------------
+    void ReportError(int ipIdx, unsigned long now) {
+        auto &ip = IPs[ipIdx];
+
+        LOG_EF(
+                "IpManager",
+                "!!! ReportError ipIdx=%d IP=%s errors=%d consecutive=%d state=%s",
+                ipIdx,
+                ip.IP.toString().c_str(),
+                ip.Errors,
+                ip.consecutiveErrors,
+                StateToString(ip.state)
+            );
+
+        ip.Errors++;
+        ip.consecutiveErrors++;
+        ip.lastErrorTime = now;
+
+        // 1. Auto-esclusione dopo troppi errori totali
+        if (ip.Errors > config.maxErrorsBeforeExclude) {
+            ip.state = IpState::EXCLUDED;
+            LOG_WF("IpManager", "IP auto-escluso: %s", ip.IP.toString().c_str());
+            return;
+        }
+
+        // 2. Dopo MAX_ERRORS (2) → entra in COOLDOWN
+        if (ip.consecutiveErrors >= config.maxErrorsBeforeCooldown) {
+            ip.state = IpState::COOLDOWN;
+
+            // 🔥 Cooldown fisso e sicuro (evita blocchi del TCP stack)
+            ip.cooldown = config.extendedCooldownMs;;   
+
+            // 🔥 log automatico
+            logSkip(ipIdx, ip, now);
+            return;
+        }
+
+        // 3. Prima dei 2 errori → non entra ancora in cooldown
+    }
+
+
+    // -------------------------
+    // Ripristino migliorato
+    // -------------------------
+    void ReportSuccess(int ipIdx) {
+        auto &ip = IPs[ipIdx];
+
+        ip.consecutiveErrors = 0;
+
+        if (ip.state == IpState::COOLDOWN) {
+            ip.state = IpState::OK;
+
+            // 🔥 log automatico
+            logRestore(ipIdx, ip);
+        }
+
+        if (ip.cooldown > config.baseCooldownMs)
+            ip.cooldown -= 1000;
+
+        if (ip.cooldown < config.baseCooldownMs)
+            ip.cooldown = config.baseCooldownMs;
+    }
+
+
+    // -------------------------
+    // Esclusione manuale
+    // -------------------------
+    void Exclude(int ipIdx) {
+        auto &ip = IPs[ipIdx];
+        ip.state = IpState::EXCLUDED;
+    }
+
+    // -------------------------
+    // Priorità
+    // -------------------------
+    PriorityMgmtEx& GetCurrentPriority(
+        int ipIdx,
+        std::vector<GenericPrgDevice>& prgDevices,
+        const GenericPrgDeviceManager& deviceManager)
+    {
+        auto &ip = IPs[ipIdx];
+        auto &p  = ip.Priority;
+
+        // LOG MINIMO
+        LOG_DF("PRIO", "GetCurrentPriority(ip=%d)", ipIdx);
+
+        int prio = p.Priorities[p.Index].Base.priority;
+
+        // ============================================================
+        // 1. Resume se interrupted
+        // ============================================================
+        for (int i = 0; i < (int)p.PrioritySize; i++) {
+            if (p.Priorities[i].Interrupted) {
+
+                if (p.Priorities[i].Base.priority == Low) {
+                    LOG_WF("LOW::RESUME",
+                        "ip=%d → RESUME LOW (interrupted)",
+                        ipIdx);
+                }
+
+                p.Index = i;
+                
+                return p.Priorities[i];
+            }
+        }
+
+        // ============================================================
+        // 2. Se la corrente è interrupted → NON ruotare
+        // ============================================================
+        if (p.Priorities[p.Index].Interrupted) {
+
+            if (p.Priorities[p.Index].Base.priority == Low) {
+                LOG_WF("LOW::STAY",
+                    "ip=%d → LOW still interrupted",
+                    ipIdx);
+            }
+
+            auto &prioEx = p.Priorities[p.Index];
+
+            return prioEx;
+        }
+
+        prio = p.Priorities[p.Index].Base.priority;
+
+        // ============================================================
+        // 3. Check se ci sono device per questa priorità
+        // ============================================================
+        const bool has = HasDevicesForPriority(
+            ipIdx,
+            static_cast<Priority>(prio),
+            deviceManager);
+
+        if (!has) {
+
+            if (prio == Low) {
+                LOG_WF("LOW::NODEV",
+                    "ip=%d → LOW has NO DEVICES → AdvancePriority()",
+                    ipIdx);
+            }
+
+            AdvancePriority(ipIdx, 0);
+            return GetCurrentPriority(ipIdx, prgDevices, deviceManager);
+        }
+
+        // ============================================================
+        // 4. Allow logic
+        // ============================================================
+        bool allow = false;
+
+        switch (prio) {
+            case High:   allow = true; break;
+            case Medium: allow = (ip.priorityCycleCounter % 2 == 0); break;
+            case Low:    allow = (ip.priorityCycleCounter % 3 == 0); break;
+            case Normal: allow = (ip.priorityCycleCounter % 2 == 0); break;
+            default:     allow = true; break;
+        }
+
+        if (!allow) {
+            AdvancePriority(ipIdx, 0);
+            return GetCurrentPriority(ipIdx, prgDevices, deviceManager);
+        }
+
+        // ============================================================
+        // 5. SELECT PRIORITY
+        // ============================================================
+        auto &prioEx = p.Priorities[p.Index];
+
+        // ⭐ inizializza il cursore solo la prima volta
+        prioEx.Cursor.init();
+
+        return prioEx;
+    }
+
+
+    void UpdatePriorityAfterRead(int ipIdx,
+                             bool interrupted,
+                             int nextDeviceIndex,
+                             int items)
+    {
+        auto &ip = IPs[ipIdx];
+        auto &p  = ip.Priority.Priorities[ip.Priority.Index];
+
+        if (interrupted) {
+            // ⭐ Caso pacing: la READ è stata interrotta
+            // → salva il punto esatto da cui riprendere
+            p.Interrupted = true;
+            p.Base.deviceIndex = nextDeviceIndex;
+            p.Cursor.save(nextDeviceIndex);     // ⭐ salva nel cursore
+            return;
+        }
+
+        // ⭐ Caso normale: la priorità NON è interrotta
+        // → il round‑robin ha già avanzato il cursore in computeRange()
+        p.Interrupted = false;
+
+        // ⭐ Incrementa il ciclo round‑robin delle priorità
+        ip.priorityCycleCounter++;
+
+        // ⭐ Avanza alla prossima priorità
+        AdvancePriority(ipIdx, items);
+    }
+
+    // -------------------------
+    // Diagnostica avanzata
+    // -------------------------
+    void PrintStatus() {
+        for (int i = 0; i < IPs.size(); i++) {
+            auto &ip = IPs[i];
+            LOG_IF("IpManager",
+                "IP %d: %s  Errors=%d  Cooldown=%lu  State=%s",
+                i,
+                ip.IP.toString().c_str(),
+                ip.Errors,
+                ip.cooldown,
+                StateToString(ip.state)
+            );
+        }
+    }
+};
 
 class ModbusManager
 {
@@ -59,426 +665,7 @@ private:
     // ============================================================
     // CONNESSIONE MODBUS PERSISTENTE
     // ============================================================
-    /*class PersistentModbusConnection
-    {
-    private:
-
-        static constexpr unsigned long INACTIVITY = 600;
-        static constexpr unsigned long IP_SWITCH_GUARD_MS = 0; //Attende il tempo in milisecondi tra le connect degli ip modbus rtu
-
-        // ========================================================
-        // CONNECTION STATE
-        // ========================================================
-        struct ConnectionState
-        {
-            IPAddress lastIp;
-            bool hasConnection = false;
-            unsigned long lastActivity = 0;
-        };
-
-        // ========================================================
-        // IP SWITCH STATE
-        // ========================================================
-        struct SwitchState
-        {
-            unsigned long time = 0;
-            bool waiting = false;
-        };
-
-        // ========================================================
-        // SOCKET STATE
-        // ========================================================
-        struct SocketState
-        {
-            DMNetworkManager* net = nullptr;
-            SocketManager::OwnerId owner = -1;
-            bool acquired = false;
-        };
-
-        ModbusTCPClient& modbusClient;
-
-        ConnectionState connection;
-        SwitchState switchState;
-        SocketState socket;
-
-    public:
-        // ========================================================
-        // ENSURE RESULT
-        // ========================================================
-        enum class EnsureResult : uint8_t
-        {
-            CONNECTED,
-            WAITING,
-            FAILED
-        };
-
-        enum class ReconnectReason
-        {
-            NONE,
-            NOT_CONNECTED,
-            IP_CHANGED,
-            INACTIVITY
-        };
-
-        // ========================================================
-        // CONSTRUCTOR
-        // ========================================================
-        explicit PersistentModbusConnection(
-            ModbusTCPClient& client)
-            : modbusClient(client),
-            connection{
-                IPAddress(0, 0, 0, 0),
-                false,
-                0
-            }
-        {
-        }
-
-
-        // ========================================================
-        // SOCKET CONTEXT
-        // ========================================================
-
-        void setSocketContext(
-            DMNetworkManager& networkManager,
-            SocketManager::OwnerId owner)
-        {
-            socket.net = &networkManager;
-            socket.owner = owner;
-        }
-
-
-        // ========================================================
-        // RELEASE SOCKET
-        // ========================================================
-
-        void releaseSocket()
-        {
-            if (!socket.net)
-            {
-                socket.acquired = false;
-                return;
-            }
-
-            if (socket.owner < 0)
-            {
-                socket.acquired = false;
-                return;
-            }
-
-            if (!socket.acquired)
-                return;
-
-            socket.net->sockets().release(
-                socket.owner,
-                0,
-                SocketManager::SocketKind::TCP_CLIENT
-            );
-
-            socket.acquired = false;
-        }
-
-
-        // ========================================================
-        // ACQUIRE SOCKET
-        // ========================================================
-
-        bool acquireSocket()
-        {
-            if (!socket.net)
-            {
-                LOG_EF(
-                    "MDB::Socket",
-                    "NetworkManager unavailable"
-                );
-
-                return false;
-            }
-
-            if (socket.owner < 0)
-            {
-                LOG_EF(
-                    "MDB::Socket",
-                    "Modbus socket owner invalid"
-                );
-
-                return false;
-            }
-
-            if (socket.acquired)
-                return true;
-
-            const int slot =
-                socket.net->sockets().acquire(
-                    socket.owner,
-                    0,
-                    SocketManager::SocketKind::TCP_CLIENT
-                );
-
-            if (slot < 0)
-            {
-                LOG_WF(
-                    "MDB::Socket",
-                    "Modbus TCP socket unavailable"
-                );
-
-                return false;
-            }
-
-            socket.acquired = true;
-
-            return true;
-        }
-
-        // ========================================================
-        // TOUCH
-        // ========================================================
-        inline void touch(
-            unsigned long now)
-        {
-            connection.lastActivity = now;
-        }
-
-        // ========================================================
-        // RECONNECT REASON
-        // ========================================================
-        inline ReconnectReason getReconnectReason(
-            const IPAddress& ip,
-            unsigned long now) const
-        {
-            if (!modbusClient.connected())
-                return ReconnectReason::NOT_CONNECTED;
-
-            if (connection.lastIp != ip)
-                return ReconnectReason::IP_CHANGED;
-
-            if (now - connection.lastActivity > INACTIVITY)
-                return ReconnectReason::INACTIVITY;
-
-            return ReconnectReason::NONE;
-        }
-
-
-        // ========================================================
-        // ENSURE CONNECTION
-        // ========================================================
-
-        EnsureResult ensure(
-            int ipIndex,
-            IpManager& ipManager,
-            int port,
-            unsigned long now)
-        {
-            auto& ips = ipManager.GetIps();
-
-            // ----------------------------------------------------
-            // VALID IP INDEX
-            // ----------------------------------------------------
-
-            if (ipIndex < 0 ||
-                static_cast<size_t>(ipIndex) >= ips.size())
-            {
-                LOG_EF(
-                    "MDB::ensure",
-                    "INVALID ipIndex=%d",
-                    ipIndex
-                );
-
-                return EnsureResult::FAILED;
-            }
-
-            // ----------------------------------------------------
-            // SHOULD QUERY
-            // ----------------------------------------------------
-            if (!ipManager.ShouldQuery(
-                    ipIndex,
-                    now))
-            {
-                return EnsureResult::FAILED;
-            }
-
-            // ====================================================
-            // ATTESA DOPO CAMBIO IP
-            // ====================================================
-            if (switchState.waiting)
-            {
-                if (now - switchState.time <
-                    IP_SWITCH_GUARD_MS)
-                {
-                    return EnsureResult::WAITING;
-                }
-
-                switchState.waiting = false;
-            }
-
-            // ----------------------------------------------------
-            // RECONNECT REASON
-            // ----------------------------------------------------
-            auto& ipStruct = ips[ipIndex];
-            const IPAddress ip = ipStruct.IP;
-
-            const ReconnectReason reason =
-                getReconnectReason(
-                    ip,
-                    now
-                );
-
-            // ====================================================
-            // CONNESSIONE VALIDA
-            // ====================================================
-
-            if (reason == ReconnectReason::NONE)
-            {
-                connection.hasConnection = true;
-
-                if (!socket.acquired)
-                {
-                    if (!acquireSocket())
-                    {
-                        connection.hasConnection = false;
-
-                        return EnsureResult::FAILED;
-                    }
-                }
-
-                if (ipStruct.state !=
-                    IpManager::IpState::OK)
-                {
-                    ipManager.ReportSuccess(
-                        ipIndex
-                    );
-                }
-
-                return EnsureResult::CONNECTED;
-            }
-
-            // ====================================================
-            // CAMBIO IP
-            // ====================================================
-            if (reason == ReconnectReason::IP_CHANGED)
-            {
-                if (modbusClient.connected())
-                    modbusClient.stop();
-
-                connection.hasConnection = false;
-
-                releaseSocket();
-
-                // ------------------------------------------------
-                // Non riconnettere nello stesso giro.
-                // Lasciamo lavorare MQTT e il resto del runtime.
-                // ------------------------------------------------
-
-                switchState.time = now;
-                switchState.waiting = true;
-
-                return EnsureResult::WAITING;
-            }
-
-            // ====================================================
-            // INACTIVITY
-            // ====================================================
-
-            if (reason == ReconnectReason::INACTIVITY)
-            {
-                if (modbusClient.connected())
-                    modbusClient.stop();
-
-                connection.hasConnection = false;
-
-                releaseSocket();
-            }
-
-
-            // ====================================================
-            // NOT CONNECTED
-            // ====================================================
-
-            if (reason == ReconnectReason::NOT_CONNECTED)
-            {
-                connection.hasConnection = false;
-
-                // La connessione può essere caduta esternamente.
-                releaseSocket();
-            }
-
-            // ====================================================
-            // ACQUIRE PRIMA DEL CONNECT
-            // ====================================================
-            if (!acquireSocket())
-            {
-                connection.hasConnection = false;
-
-                return EnsureResult::FAILED;
-            }
-
-            // ====================================================
-            // CONNECT
-            // ====================================================
-            const unsigned long start = millis();
-
-            const bool connected =
-                modbusClient.begin(
-                    ip,
-                    port
-                );
-
-            const unsigned long duration =
-                millis() - start;
-
-
-            // ----------------------------------------------------
-            // Log solo in caso di connect lento
-            // ----------------------------------------------------
-
-            if (duration > 100)
-            {
-                LOG_WF(
-                    "MDB::CONNECT",
-                    "ip=%s result=%d duration=%lu ms",
-                    ip.toString().c_str(),
-                    connected,
-                    duration
-                );
-            }
-
-            // ====================================================
-            // CONNECT FALLITO
-            // ====================================================
-
-            if (!connected)
-            {
-                connection.hasConnection = false;
-
-                releaseSocket();
-
-                ipManager.ReportError(
-                    ipIndex,
-                    now
-                );
-
-                return EnsureResult::FAILED;
-            }
-
-            // ====================================================
-            // CONNECT SUCCESS
-            // ====================================================
-
-            connection.lastIp = ip;
-            connection.lastActivity = now;
-            connection.hasConnection = true;
-
-            if (ipStruct.state !=
-                IpManager::IpState::OK)
-            {
-                ipManager.ReportSuccess(
-                    ipIndex
-                );
-            }
-
-            return EnsureResult::CONNECTED;
-        }
-    };*/
+    
     class PersistentModbusConnection
     {
     private:
@@ -555,7 +742,7 @@ private:
         // ============================================================
 
         explicit PersistentModbusConnection(
-            ModbusTCPClient& client)
+            DMPlatform::Modbus::TCPClient& client)
             : modbusClient(client)
         {
         }
@@ -1377,7 +1564,7 @@ public:
     // RUN CLIENT
     // ============================================================
     ClientState RunClient(
-        ModbusTCPClient& modbusClient,
+        DMPlatform::Modbus::TCPClient& modbusClient,
         short ipIndex,
         int port,
         std::vector<uint16_t>& mbRead,
@@ -1819,7 +2006,7 @@ private:
     // ============================================================
 
     inline bool DeviceRead(
-        ModbusTCPClient& modbusClient,
+        DMPlatform::Modbus::TCPClient& modbusClient,
         short ipIndex,
         std::vector<uint16_t>& mbRead,
         unsigned long now)
@@ -1844,7 +2031,7 @@ private:
     // ============================================================
 
     inline bool DeviceWrite(
-        ModbusTCPClient& modbusClient,
+        DMPlatform::Modbus::TCPClient& modbusClient,
         IPAddress ip,
         unsigned long now)
     {
@@ -1865,7 +2052,7 @@ private:
 
     bool DeviceManagement_Write(
         LedController* ledsController,
-        ModbusTCPClient& modbusTCPCli,
+        DMPlatform::Modbus::TCPClient& modbusTCPCli,
         IPAddress ip,
         Buffer& buffer,
         std::vector<GenericPrgDevice>& prgDevices,
@@ -2748,7 +2935,7 @@ private:
                 // ------------------------------------------------
                 if (hasWriteForIp(ipIndex))
                 {
-                    LOG_WF(
+                    LOG_DF(
                         "ModbusManager",
                         "WRITE locale rilevata durante READ "
                         "→ interrompo DeviceRead (ip=%d)",

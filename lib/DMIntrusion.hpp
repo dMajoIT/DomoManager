@@ -1701,40 +1701,479 @@ protected:
 };
 
 
+class IntrusionBoardFaultManager
+{
+public:
+    using AreaErrorProvider = std::function<bool(int)>;
+
+private:
+    std::vector<std::vector<int>> hardwareAreas;
+    std::unordered_map<int, std::vector<size_t>> areaToSensors;
+
+    std::vector<uint8_t> sensorAnomaly;
+    std::vector<uint8_t> zoneAnomaly;
+
+    // Buffer riutilizzato per evitare allocazioni in
+    // recomputeZoneAnomaly().
+    std::vector<uint8_t> zoneAnomalyWork;
+
+    AreaErrorProvider areaErrorProvider = nullptr;
+
+    bool recomputeZoneAnomaly(WiredSensorsManager& ws)
+    {
+        const size_t zoneCount = ws.GetZoneCount();
+        const size_t sensorCount =
+            std::min(ws.Count(), sensorAnomaly.size());
+
+        if (zoneAnomaly.size() != zoneCount)
+            zoneAnomaly.assign(zoneCount, 0);
+
+        if (zoneAnomalyWork.size() != zoneCount)
+            zoneAnomalyWork.resize(zoneCount);
+
+        std::fill(
+            zoneAnomalyWork.begin(),
+            zoneAnomalyWork.end(),
+            uint8_t(0)
+        );
+
+        for (size_t i = 0; i < sensorCount; ++i)
+        {
+            if (!sensorAnomaly[i])
+                continue;
+
+            const Sensor* sensor =
+                ws.GetSensor(i);
+
+            if (!sensor || !sensor->IsEnabled())
+                continue;
+
+            const int zoneIndex =
+                ws.GetSensorZoneIndex(i);
+
+            if (zoneIndex >= 0 &&
+                static_cast<size_t>(zoneIndex) < zoneCount)
+            {
+                zoneAnomalyWork[
+                    static_cast<size_t>(zoneIndex)
+                ] = 1;
+            }
+        }
+
+        if (zoneAnomalyWork == zoneAnomaly)
+            return false;
+
+        zoneAnomaly.swap(zoneAnomalyWork);
+        return true;
+    }
+
+    bool updateSensorState(size_t sensorIndex)
+    {
+        if (sensorIndex >= hardwareAreas.size() ||
+            sensorIndex >= sensorAnomaly.size())
+        {
+            return false;
+        }
+
+        uint8_t newState = 0;
+
+        if (areaErrorProvider)
+        {
+            for (const int area : hardwareAreas[sensorIndex])
+            {
+                if (area >= 0 &&
+                    areaErrorProvider(area))
+                {
+                    newState = 1;
+                    break;
+                }
+            }
+        }
+
+        if (sensorAnomaly[sensorIndex] == newState)
+            return false;
+
+        sensorAnomaly[sensorIndex] = newState;
+        return true;
+    }
+
+public:
+    void Setup(
+        WiredSensorsManager& ws,
+        AreaErrorProvider provider)
+    {
+        areaErrorProvider =
+            std::move(provider);
+
+        const size_t sensorCount =
+            ws.Count();
+
+        const size_t zoneCount =
+            ws.GetZoneCount();
+
+        hardwareAreas.assign(
+            sensorCount,
+            {}
+        );
+
+        sensorAnomaly.assign(
+            sensorCount,
+            0
+        );
+
+        zoneAnomaly.assign(
+            zoneCount,
+            0
+        );
+
+        zoneAnomalyWork.assign(
+            zoneCount,
+            0
+        );
+
+        areaToSensors.clear();
+
+        for (size_t i = 0;
+             i < sensorCount;
+             ++i)
+        {
+            const size_t readerCount =
+                ws.GetReaderCount(i);
+
+            auto& areas =
+                hardwareAreas[i];
+
+            areas.reserve(readerCount);
+
+            for (size_t j = 0;
+                 j < readerCount;
+                 ++j)
+            {
+                const int area =
+                    ws.GetReaderArea(i, j);
+
+                if (area < 0)
+                    continue;
+
+                if (std::find(
+                        areas.begin(),
+                        areas.end(),
+                        area) != areas.end())
+                {
+                    continue;
+                }
+
+                areas.push_back(area);
+                areaToSensors[area].push_back(i);
+            }
+        }
+
+        UpdateAll(ws);
+    }
+
+    bool UpdateArea(
+        WiredSensorsManager& ws,
+        int area)
+    {
+        if (area < 0)
+            return false;
+
+        const auto it =
+            areaToSensors.find(area);
+
+        if (it == areaToSensors.end())
+            return false;
+
+        bool changed = false;
+
+        for (const size_t sensorIndex : it->second)
+        {
+            if (updateSensorState(sensorIndex))
+                changed = true;
+        }
+
+        if (changed)
+            recomputeZoneAnomaly(ws);
+
+        return changed;
+    }
+
+    bool UpdateAll(
+        WiredSensorsManager& ws)
+    {
+        bool changed = false;
+
+        const size_t count =
+            std::min(
+                ws.Count(),
+                sensorAnomaly.size()
+            );
+
+        for (size_t i = 0;
+             i < count;
+             ++i)
+        {
+            if (updateSensorState(i))
+                changed = true;
+        }
+
+        if (changed)
+            recomputeZoneAnomaly(ws);
+
+        return changed;
+    }
+
+    bool RefreshZoneAnomaly(
+        WiredSensorsManager& ws)
+    {
+        return recomputeZoneAnomaly(ws);
+    }
+
+    inline bool IsSensorAnomaly(
+        size_t sensorIndex) const
+    {
+        return sensorIndex < sensorAnomaly.size() &&
+               sensorAnomaly[sensorIndex] != 0;
+    }
+
+    inline bool IsZoneAnomaly(
+        size_t zoneIndex) const
+    {
+        return zoneIndex < zoneAnomaly.size() &&
+               zoneAnomaly[zoneIndex] != 0;
+    }
+
+    size_t GetEnabledSensorAnomalyCount(
+        WiredSensorsManager& ws) const
+    {
+        const size_t sensorCount =
+            std::min(
+                sensorAnomaly.size(),
+                ws.Count()
+            );
+
+        size_t count = 0;
+
+        for (size_t i = 0;
+            i < sensorCount;
+            ++i)
+        {
+            if (!sensorAnomaly[i])
+                continue;
+
+            const Sensor* sensor =
+                ws.GetSensor(i);
+
+            if (!sensor ||
+                !sensor->IsEnabled())
+            {
+                continue;
+            }
+
+            const int zoneIndex =
+                ws.GetSensorZoneIndex(i);
+
+            // Sensore non zonato oppure zona non trovata:
+            // manteniamo il comportamento attuale.
+            if (zoneIndex >= 0)
+            {
+                const char* zone =
+                    ws.GetZoneName(
+                        static_cast<size_t>(zoneIndex)
+                    );
+
+                if (zone &&
+                    zone[0] &&
+                    !ws.Zones().IsZoneEnabled(zone))
+                {
+                    continue;
+                }
+            }
+
+            ++count;
+        }
+
+        return count;
+    }
+
+    size_t GetSensorAnomalyCount() const
+    {
+        size_t count = 0;
+
+        for (const uint8_t state :
+             sensorAnomaly)
+        {
+            if (state)
+                ++count;
+        }
+
+        return count;
+    }
+
+    size_t GetEnabledZoneAnomalyCount(
+        WiredSensorsManager& ws) const
+    {
+        const size_t zoneCount =
+            std::min(
+                zoneAnomaly.size(),
+                ws.GetZoneCount()
+            );
+
+        size_t count = 0;
+
+        for (size_t i = 0;
+            i < zoneCount;
+            ++i)
+        {
+            if (!zoneAnomaly[i])
+                continue;
+
+            const char* zone =
+                ws.GetZoneName(i);
+
+            if (!zone ||
+                !zone[0])
+            {
+                continue;
+            }
+
+            // Una zona disabilitata NON contribuisce
+            // all'anomalia globale della centrale.
+            if (!ws.Zones().IsZoneEnabled(zone))
+                continue;
+
+            ++count;
+        }
+
+        return count;
+    }
+
+    size_t GetZoneAnomalyCount() const
+    {
+        size_t count = 0;
+
+        for (const uint8_t state :
+             zoneAnomaly)
+        {
+            if (state)
+                ++count;
+        }
+
+        return count;
+    }
+
+    int GetSensorHardwareArea(
+        size_t sensorIndex) const
+    {
+        if (sensorIndex >= hardwareAreas.size() ||
+            hardwareAreas[sensorIndex].empty())
+        {
+            return -1;
+        }
+
+        return hardwareAreas[sensorIndex][0];
+    }
+
+    const std::vector<int>&
+    GetSensorHardwareAreas(
+        size_t sensorIndex) const
+    {
+        static const std::vector<int> empty;
+
+        if (sensorIndex >= hardwareAreas.size())
+            return empty;
+
+        return hardwareAreas[sensorIndex];
+    }
+
+    void Report(
+        WiredSensorsManager& ws) const
+    {
+        const auto* cfg =
+            ws.GetConfig();
+
+        const size_t sensorCount =
+            ws.Count();
+
+        LOG_IF(
+            "IntrusionBoardFaultManager",
+            "===== SENSOR ANOMALY MAP ====="
+        );
+
+        const size_t count =
+            std::min(
+                sensorCount,
+                hardwareAreas.size()
+            );
+
+        for (size_t i = 0;
+             i < count;
+             ++i)
+        {
+            const char* name =
+                (cfg && cfg[i].name)
+                    ? cfg[i].name
+                    : "?";
+
+            const char* zone =
+                (cfg && cfg[i].zone)
+                    ? cfg[i].zone
+                    : "?";
+
+            LOG_IF(
+                "IntrusionBoardFaultManager",
+                "Sensor[%u] name=%s zone=%s anomaly=%d areas=%u",
+                (unsigned)i,
+                name,
+                zone,
+                IsSensorAnomaly(i) ? 1 : 0,
+                (unsigned)hardwareAreas[i].size()
+            );
+
+            for (size_t j = 0;
+                 j < hardwareAreas[i].size();
+                 ++j)
+            {
+                LOG_IF(
+                    "IntrusionBoardFaultManager",
+                    "  area[%u]=%d",
+                    (unsigned)j,
+                    hardwareAreas[i][j]
+                );
+            }
+        }
+
+        LOG_IF(
+            "IntrusionBoardFaultManager",
+            "Sensor anomalies : %u",
+            (unsigned)GetSensorAnomalyCount()
+        );
+
+        LOG_IF(
+            "IntrusionBoardFaultManager",
+            "Zone anomalies   : %u",
+            (unsigned)GetZoneAnomalyCount()
+        );
+
+        LOG_IF(
+            "IntrusionBoardFaultManager",
+            "=============================="
+        );
+    }
+};
 
 class SecurityOrchestrator
 {
 public:
-
     // ============================================================
     // ALARM PANEL COMMAND
     // ============================================================
-    enum PanelBitCommand : uint8_t
-    {
-        BITCMD_SILENCE_ALARM = 0,
-        // BITCMD_... = 1,
-        // BITCMD_... = 2,
-        // BITCMD_... = 3,
-    };
-
-    enum AlarmPanelCommand : uint8_t
-    {
-        DISARM = 0,
-        ARM_AWAY,
-        ARM_STAY,
-        ARM_NIGHT
-    };
-
+    enum PanelBitCommand : uint8_t { BITCMD_SILENCE_ALARM = 0 };
+    enum AlarmPanelCommand : uint8_t { DISARM = 0, ARM_AWAY, ARM_STAY, ARM_NIGHT };
 
     // ============================================================
     // CHANGE FLAGS
-    //
-    // Indicano quale parte del sistema security ha rilevato
-    // una variazione durante il ciclo.
-    //
-    // È un bitmask, quindi più variazioni possono coesistere.
     // ============================================================
-
     enum ChangeFlags : uint8_t
     {
         CHANGE_NONE    = 0,
@@ -1746,119 +2185,65 @@ public:
         CHANGE_COMMAND = 1 << 5
     };
 
-
     // ============================================================
     // REPORT MODE
     // ============================================================
-
     enum class ReportMode : uint8_t
     {
-        CORE,
-        CONFIG,
-        SENSORS,
-        ZONES,
-        COMMANDS,
-        SYSTEM,
-        SECURITY,
-        HMI,
-        INCONSISTENCIES,
-        DIAGNOSTICS,
-        FULL
+        CORE, CONFIG, SENSORS, ZONES, COMMANDS, SYSTEM,
+        SECURITY, HMI, INCONSISTENCIES, DIAGNOSTICS, FULL
     };
-
 
     // ============================================================
     // SYSTEM MANAGER
     // ============================================================
-
+    
     class SystemManager
     {
     public:
-
         enum Field
         {
-            // ============================================================
-            // REALTIME
-            // ============================================================
-
-            ALARM_INTRUSION,          // bit 0
-            ALARM_INTRUSION_H24,      // bit 1
-            ALARM_FLOOD,              // bit 2
-            ALARM_SMOKE,              // bit 3
-            WINDOWS_OPEN,             // bit 4
-            DOORS_OPEN,               // bit 5
-
-
-            // ============================================================
-            // MEMORY
-            // ============================================================
-
-            ALARM_INTRUSION_MEM,      // bit 6
-            ALARM_INTRUSION_H24_MEM,  // bit 7
-            ALARM_FLOOD_MEM,          // bit 8
-            ALARM_SMOKE_MEM,          // bit 9
-            WINDOWS_OPEN_MEM,         // bit 10
-            DOORS_OPEN_MEM,           // bit 11
-
-
-            // ============================================================
-            // GLOBAL
-            // ============================================================
-
-            ALARM_TAMPER,             // bit 12
-
-
+            ALARM_INTRUSION,
+            ALARM_INTRUSION_H24,
+            ALARM_FLOOD,
+            ALARM_SMOKE,
+            WINDOWS_OPEN,
+            DOORS_OPEN,
+            ALARM_INTRUSION_MEM,
+            ALARM_INTRUSION_H24_MEM,
+            ALARM_FLOOD_MEM,
+            ALARM_SMOKE_MEM,
+            WINDOWS_OPEN_MEM,
+            DOORS_OPEN_MEM,
+            ALARM_TAMPER,
+            ALARM_PANIC,
+            GLOBAL_TROUBLE,
             FIELD_COUNT
         };
 
-
-        struct Info
-        {
-            Cell<bool> f[FIELD_COUNT];
-        };
-
-
+        struct Info { Cell<bool> f[FIELD_COUNT]; };
         Info info;
-
-
-        // --------------------------------------------------------
-        // CONSTRUCTOR
-        // --------------------------------------------------------
 
         SystemManager()
         {
-            for (int i = 0; i < FIELD_COUNT; ++i)
+            for(int i=0;i<FIELD_COUNT;++i)
                 info.f[i].set(false);
         }
 
-
-        // --------------------------------------------------------
-        // SET FIELD
-        // --------------------------------------------------------
-
-        void set(
-            Field f,
-            bool v)
+        void set(Field f,bool v)
         {
             info.f[f].setIfDiff(v);
         }
 
-
-        // --------------------------------------------------------
-        // HAS CHANGED
-        //
-        // Legge e consuma il flag di modifica.
-        // --------------------------------------------------------
-
         bool hasChanged()
         {
-            bool changed = false;
+            bool changed=false;
 
-            for (int i = 0; i < FIELD_COUNT; ++i)
+            for(int i=0;i<FIELD_COUNT;++i)
             {
-                if (info.f[i].hasChanged())
+                if(info.f[i].hasChanged())
                 {
-                    changed = true;
+                    changed=true;
                     info.f[i].resetChanged();
                 }
             }
@@ -1866,41 +2251,49 @@ public:
             return changed;
         }
 
-
-        // --------------------------------------------------------
-        // BITMASK
-        // --------------------------------------------------------
-
         int getBitmask() const
         {
-            int mask = 0;
+            int mask=0;
 
-            for (int i = 0; i < FIELD_COUNT; ++i)
+            for(int i=0;i<FIELD_COUNT;++i)
             {
-                if (!info.f[i].get())
-                    continue;
-
-                mask |= (1 << i);
+                if(info.f[i].get())
+                    mask|=(1<<i);
             }
 
             return mask;
         }
 
-
-        // --------------------------------------------------------
-        // COMPUTE FROM WIRED SENSORS
-        // --------------------------------------------------------
+       
+        // ============================================================
+        // COMPUTE SYSTEM STATE
+        //
+        // Le MEM 6..11 sono memoria della CENTRALE.
+        // Non vengono prese da st.mem del sensore.
+        //
+        // Una memoria centrale viene impostata solo se:
+        //   - la centrale è inserita
+        //   - esiste il relativo allarme realtime
+        //
+        // Dopo il disinserimento rimane memorizzata fino al TACITA.
+        // ============================================================
 
         void ComputeFrom(
-            const WiredSensorsManager& ws)
+            const WiredSensorsManager& ws,
+            bool boardTrouble = false,
+            bool alarmEngaged = false)
         {
-            auto st =
+            const auto st =
                 ws.ComputeAggregate();
 
-
-            // ============================================================
+            // --------------------------------------------------------
             // REALTIME
-            // ============================================================
+            // --------------------------------------------------------
+
+            set(
+                ALARM_PANIC,
+                st.panic
+            );
 
             set(
                 ALARM_INTRUSION,
@@ -1932,216 +2325,90 @@ public:
                 st.normal.doorsOpen
             );
 
+            // --------------------------------------------------------
+            // MEMORIA CENTRALE
+            //
+            // Si attiva SOLO durante centrale inserita.
+            // Non viene mai ricopiata da st.mem.
+            // --------------------------------------------------------
 
-            // ============================================================
-            // MEMORY
-            // ============================================================
+            if(alarmEngaged &&
+                SecurityOrchestrator::HasUnsilencedMemory())
+            {
+                if(st.mem.intrusion)
+                    set(ALARM_INTRUSION_MEM, true);
 
-            set(
-                ALARM_INTRUSION_MEM,
-                st.mem.intrusion
-            );
+                if(st.mem.intrusionH24)
+                    set(ALARM_INTRUSION_H24_MEM, true);
 
-            set(
-                ALARM_INTRUSION_H24_MEM,
-                st.mem.intrusionH24
-            );
+                if(st.mem.flood)
+                    set(ALARM_FLOOD_MEM, true);
 
-            set(
-                ALARM_FLOOD_MEM,
-                st.mem.flood
-            );
+                if(st.mem.smoke)
+                    set(ALARM_SMOKE_MEM, true);
 
-            set(
-                ALARM_SMOKE_MEM,
-                st.mem.smoke
-            );
+                if(st.mem.windowsOpen)
+                    set(WINDOWS_OPEN_MEM, true);
 
-            set(
-                WINDOWS_OPEN_MEM,
-                st.mem.windowsOpen
-            );
-
-            set(
-                DOORS_OPEN_MEM,
-                st.mem.doorsOpen
-            );
+                if(st.mem.doorsOpen)
+                    set(DOORS_OPEN_MEM, true);
+            }
 
 
-            // ============================================================
-            // GLOBAL
-            // ============================================================
+            // --------------------------------------------------------
+            // SERVIZIO
+            // --------------------------------------------------------
 
             set(
                 ALARM_TAMPER,
                 st.tamper
             );
+
+            set(
+                GLOBAL_TROUBLE,
+                boardTrouble
+            );
         }
 
+        // ============================================================
+        // RESET MEMORIE CENTRALE
+        //
+        // Il TACITA cancella le memorie della centrale,
+        // ma NON le memorie dei singoli sensori.
+        // ============================================================
 
-        // --------------------------------------------------------
-        // REPORT
-        // --------------------------------------------------------
+        void ResetAlarmMemories()
+        {
+            set(ALARM_INTRUSION_MEM,     false);
+            set(ALARM_INTRUSION_H24_MEM, false);
+            set(ALARM_FLOOD_MEM,         false);
+            set(ALARM_SMOKE_MEM,         false);
+            set(WINDOWS_OPEN_MEM,        false);
+            set(DOORS_OPEN_MEM,          false);
+
+        }
 
         void Report() const
         {
-            LOG_IF(
-                "SystemManager",
-                "===== SYSTEM STATE ====="
-            );
-
-
-            // ====================================================
-            // REALTIME
-            // ====================================================
-
-            LOG_IF(
-                "SystemManager",
-                "%-25s : %s",
-                "Intrusion REALTIME",
-                info.f[ALARM_INTRUSION].get()
-                    ? "TRUE"
-                    : "false"
-            );
-
-            LOG_IF(
-                "SystemManager",
-                "%-25s : %s",
-                "Intrusion H24 REALTIME",
-                info.f[ALARM_INTRUSION_H24].get()
-                    ? "TRUE"
-                    : "false"
-            );
-
-            LOG_IF(
-                "SystemManager",
-                "%-25s : %s",
-                "Flood REALTIME",
-                info.f[ALARM_FLOOD].get()
-                    ? "TRUE"
-                    : "false"
-            );
-
-            LOG_IF(
-                "SystemManager",
-                "%-25s : %s",
-                "Smoke REALTIME",
-                info.f[ALARM_SMOKE].get()
-                    ? "TRUE"
-                    : "false"
-            );
-
-            LOG_IF(
-                "SystemManager",
-                "%-25s : %s",
-                "Windows Open REALTIME",
-                info.f[WINDOWS_OPEN].get()
-                    ? "TRUE"
-                    : "false"
-            );
-
-            LOG_IF(
-                "SystemManager",
-                "%-25s : %s",
-                "Doors Open REALTIME",
-                info.f[DOORS_OPEN].get()
-                    ? "TRUE"
-                    : "false"
-            );
-
-
-            // ====================================================
-            // MEMORY
-            // ====================================================
-
-            LOG_IF(
-                "SystemManager",
-                "%-25s : %s",
-                "Intrusion MEM",
-                info.f[ALARM_INTRUSION_MEM].get()
-                    ? "TRUE"
-                    : "false"
-            );
-
-            LOG_IF(
-                "SystemManager",
-                "%-25s : %s",
-                "Intrusion H24 MEM",
-                info.f[ALARM_INTRUSION_H24_MEM].get()
-                    ? "TRUE"
-                    : "false"
-            );
-
-            LOG_IF(
-                "SystemManager",
-                "%-25s : %s",
-                "Flood MEM",
-                info.f[ALARM_FLOOD_MEM].get()
-                    ? "TRUE"
-                    : "false"
-            );
-
-            LOG_IF(
-                "SystemManager",
-                "%-25s : %s",
-                "Smoke MEM",
-                info.f[ALARM_SMOKE_MEM].get()
-                    ? "TRUE"
-                    : "false"
-            );
-
-            LOG_IF(
-                "SystemManager",
-                "%-25s : %s",
-                "Windows Open MEM",
-                info.f[WINDOWS_OPEN_MEM].get()
-                    ? "TRUE"
-                    : "false"
-            );
-
-            LOG_IF(
-                "SystemManager",
-                "%-25s : %s",
-                "Doors Open MEM",
-                info.f[DOORS_OPEN_MEM].get()
-                    ? "TRUE"
-                    : "false"
-            );
-
-
-            // ====================================================
-            // GLOBAL
-            // ====================================================
-
-            LOG_IF(
-                "SystemManager",
-                "%-25s : %s",
-                "Tamper",
-                info.f[ALARM_TAMPER].get()
-                    ? "TRUE"
-                    : "false"
-            );
-
-
-            // ====================================================
-            // BITMASK
-            // ====================================================
-
-            LOG_IF(
-                "SystemManager",
-                "Bitmask                : 0x%08X",
-                (unsigned)getBitmask()
-            );
-
-            LOG_IF(
-                "SystemManager",
-                "========================"
-            );
+            LOG_IF("SystemManager","===== SYSTEM STATE =====");
+            LOG_IF("SystemManager","%-25s : %s","Intrusion REALTIME",info.f[ALARM_INTRUSION].get()?"TRUE":"false");
+            LOG_IF("SystemManager","%-25s : %s","Intrusion H24 REALTIME",info.f[ALARM_INTRUSION_H24].get()?"TRUE":"false");
+            LOG_IF("SystemManager","%-25s : %s","Flood REALTIME",info.f[ALARM_FLOOD].get()?"TRUE":"false");
+            LOG_IF("SystemManager","%-25s : %s","Smoke REALTIME",info.f[ALARM_SMOKE].get()?"TRUE":"false");
+            LOG_IF("SystemManager","%-25s : %s","Windows Open REALTIME",info.f[WINDOWS_OPEN].get()?"TRUE":"false");
+            LOG_IF("SystemManager","%-25s : %s","Doors Open REALTIME",info.f[DOORS_OPEN].get()?"TRUE":"false");
+            LOG_IF("SystemManager","%-25s : %s","Intrusion MEM",info.f[ALARM_INTRUSION_MEM].get()?"TRUE":"false");
+            LOG_IF("SystemManager","%-25s : %s","Intrusion H24 MEM",info.f[ALARM_INTRUSION_H24_MEM].get()?"TRUE":"false");
+            LOG_IF("SystemManager","%-25s : %s","Flood MEM",info.f[ALARM_FLOOD_MEM].get()?"TRUE":"false");
+            LOG_IF("SystemManager","%-25s : %s","Smoke MEM",info.f[ALARM_SMOKE_MEM].get()?"TRUE":"false");
+            LOG_IF("SystemManager","%-25s : %s","Windows Open MEM",info.f[WINDOWS_OPEN_MEM].get()?"TRUE":"false");
+            LOG_IF("SystemManager","%-25s : %s","Doors Open MEM",info.f[DOORS_OPEN_MEM].get()?"TRUE":"false");
+            LOG_IF("SystemManager","%-25s : %s","Tamper",info.f[ALARM_TAMPER].get()?"TRUE":"false");
+            LOG_IF("SystemManager","%-25s : %s","Panic",info.f[ALARM_PANIC].get()?"TRUE":"false");
+            LOG_IF("SystemManager","%-25s : %s","Global Trouble",info.f[GLOBAL_TROUBLE].get()?"TRUE":"false");
+            LOG_IF("SystemManager","Bitmask                : 0x%08X",(unsigned)getBitmask());
+            LOG_IF("SystemManager","========================");
         }
-
-        // --------------------------------------------------------
-        // COMPATIBILITÀ
-        // --------------------------------------------------------
 
         void DiagnosticReport() const
         {
@@ -2149,38 +2416,26 @@ public:
         }
     };
 
-
 private:
-    
     // ============================================================
     // STATIC STATE
     // ============================================================
-
+    static inline IntrusionBoardFaultManager boardFaults;
     static inline SystemManager system;
-
     static inline WiredSensorsManager ws;
-
     static inline FrontendConfig::Security cfgCopy;
-
     static inline bool initialized = false;
-
     static inline AlarmBitmaskManager alarmMask;
-
-    // Ultimo risultato di Loop()
     static inline uint8_t lastChanges = CHANGE_NONE;
-
-    // Istante dell'ultimo Loop()
+    static inline uint8_t pendingChanges = CHANGE_NONE;
     static inline unsigned long lastLoopAt = 0;
-
 
     // ============================================================
     // VALIDATION
     // ============================================================
-
-    static bool validate(
-        const FrontendConfig::Security* cfg)
+    static bool validate(const FrontendConfig::Security* cfg)
     {
-        if (!cfg)
+        if(!cfg)
         {
             LOG_EF(
                 "SecurityOrchestrator",
@@ -2189,11 +2444,7 @@ private:
             return false;
         }
 
-        // --------------------------------------------------------
-        // WIRED SENSORS
-        // --------------------------------------------------------
-
-        if (!cfg->sensors || cfg->count == 0)
+        if(!cfg->sensors || cfg->count == 0)
         {
             LOG_EF(
                 "SecurityOrchestrator",
@@ -2202,11 +2453,11 @@ private:
             return false;
         }
 
-        for (size_t i = 0; i < cfg->count; ++i)
+        for(size_t i = 0; i < cfg->count; ++i)
         {
             const auto& s = cfg->sensors[i];
 
-            if (!s.name || !s.name[0])
+            if(!s.name || !s.name[0])
             {
                 LOG_EF(
                     "SecurityOrchestrator",
@@ -2216,18 +2467,24 @@ private:
                 return false;
             }
 
-            if (!s.zone || !s.zone[0])
+            // Zona opzionale.
+            //
+            // nullptr = sensore globale/non zonato
+            // ""      = configurazione errata
+            //
+            if(s.zone && !s.zone[0])
             {
-                LOG_EF(
+                LOG_WF(
                     "SecurityOrchestrator",
-                    "Validate: sensor[%u] '%s' has invalid zone",
+                    "Validate: sensor[%u] '%s' has empty zone",
                     (unsigned)i,
                     s.name
                 );
+
                 return false;
             }
 
-            if (s.channels.size() == 0)
+            if(s.channels.size() == 0)
             {
                 LOG_EF(
                     "SecurityOrchestrator",
@@ -2238,7 +2495,7 @@ private:
                 return false;
             }
 
-            if (s.channels.size() != s.readers.size())
+            if(s.channels.size() != s.readers.size())
             {
                 LOG_EF(
                     "SecurityOrchestrator",
@@ -2251,17 +2508,17 @@ private:
                 return false;
             }
 
-            // Controllo duplicazione dei tipi di canale
-            bool usedTypes[4] = { false, false, false, false };
+            bool usedTypes[4] = {};
 
-            for (size_t j = 0; j < s.channels.size(); ++j)
+            for(size_t j = 0; j < s.channels.size(); ++j)
             {
-                const auto& ch = s.channels.begin()[j];
+                const auto& ch =
+                    *(s.channels.begin() + j);
 
                 const size_t typeIndex =
                     static_cast<size_t>(ch.type);
 
-                if (typeIndex >= 4)
+                if(typeIndex >= 4)
                 {
                     LOG_EF(
                         "SecurityOrchestrator",
@@ -2273,7 +2530,7 @@ private:
                     return false;
                 }
 
-                if (usedTypes[typeIndex])
+                if(usedTypes[typeIndex])
                 {
                     LOG_EF(
                         "SecurityOrchestrator",
@@ -2287,7 +2544,7 @@ private:
 
                 usedTypes[typeIndex] = true;
 
-                if (!s.readers.begin()[j])
+                if(!*(s.readers.begin() + j))
                 {
                     LOG_EF(
                         "SecurityOrchestrator",
@@ -2302,26 +2559,26 @@ private:
         }
 
         // --------------------------------------------------------
-        // SENSOR AREAS
+        // SENSOR COMMAND AREAS
         // --------------------------------------------------------
 
-        // cmdArea: ogni sensore deve avere un'area diversa
-        // quando l'area è effettivamente configurata.
-        for (size_t i = 0; i < cfg->count; ++i)
+        for(size_t i = 0; i < cfg->count; ++i)
         {
-            const int cmdArea = cfg->sensors[i].cmdArea;
+            const int cmdArea =
+                cfg->sensors[i].cmdArea;
 
-            if (cmdArea < 0)
+            if(cmdArea < 0)
                 continue;
 
-            for (size_t j = i + 1; j < cfg->count; ++j)
+            for(size_t j = i + 1;
+                j < cfg->count;
+                ++j)
             {
-                if (cfg->sensors[j].cmdArea == cmdArea)
+                if(cfg->sensors[j].cmdArea == cmdArea)
                 {
                     LOG_EF(
                         "SecurityOrchestrator",
-                        "Validate: duplicated sensor cmdArea=%d "
-                        "('%s' and '%s')",
+                        "Validate: duplicated sensor cmdArea=%d ('%s' and '%s')",
                         cmdArea,
                         cfg->sensors[i].name,
                         cfg->sensors[j].name
@@ -2331,23 +2588,27 @@ private:
             }
         }
 
-        // statusArea: un'area = un solo oggetto.
-        for (size_t i = 0; i < cfg->count; ++i)
-        {
-            const int statusArea = cfg->sensors[i].statusArea;
+        // --------------------------------------------------------
+        // SENSOR STATUS AREAS
+        // --------------------------------------------------------
 
-            if (statusArea < 0)
+        for(size_t i = 0; i < cfg->count; ++i)
+        {
+            const int statusArea =
+                cfg->sensors[i].statusArea;
+
+            if(statusArea < 0)
                 continue;
 
-            // collisione tra sensori
-            for (size_t j = i + 1; j < cfg->count; ++j)
+            for(size_t j = i + 1;
+                j < cfg->count;
+                ++j)
             {
-                if (cfg->sensors[j].statusArea == statusArea)
+                if(cfg->sensors[j].statusArea == statusArea)
                 {
                     LOG_EF(
                         "SecurityOrchestrator",
-                        "Validate: duplicated sensor statusArea=%d "
-                        "('%s' and '%s')",
+                        "Validate: duplicated sensor statusArea=%d ('%s' and '%s')",
                         statusArea,
                         cfg->sensors[i].name,
                         cfg->sensors[j].name
@@ -2356,13 +2617,12 @@ private:
                 }
             }
 
-            // collisione con system status
-            if (statusArea == cfg->statusArea && cfg->statusArea >= 0)
+            if(cfg->statusArea >= 0 &&
+            statusArea == cfg->statusArea)
             {
                 LOG_EF(
                     "SecurityOrchestrator",
-                    "Validate: sensor '%s' statusArea=%d "
-                    "collides with security statusArea",
+                    "Validate: sensor '%s' statusArea=%d collides with security statusArea",
                     cfg->sensors[i].name,
                     statusArea
                 );
@@ -2374,7 +2634,7 @@ private:
         // ZONE CONFIG
         // --------------------------------------------------------
 
-        if (cfg->zoneCount > 0 && !cfg->zones)
+        if(cfg->zoneCount > 0 && !cfg->zones)
         {
             LOG_EF(
                 "SecurityOrchestrator",
@@ -2384,11 +2644,11 @@ private:
             return false;
         }
 
-        for (size_t i = 0; i < cfg->zoneCount; ++i)
+        for(size_t i = 0; i < cfg->zoneCount; ++i)
         {
             const auto& z = cfg->zones[i];
 
-            if (!z.name || !z.name[0])
+            if(!z.name || !z.name[0])
             {
                 LOG_EF(
                     "SecurityOrchestrator",
@@ -2398,7 +2658,7 @@ private:
                 return false;
             }
 
-            if (z.statusArea < 0)
+            if(z.statusArea < 0)
             {
                 LOG_EF(
                     "SecurityOrchestrator",
@@ -2409,11 +2669,15 @@ private:
                 return false;
             }
 
-            // nome zona duplicato
-            for (size_t j = i + 1; j < cfg->zoneCount; ++j)
+            for(size_t j = i + 1;
+                j < cfg->zoneCount;
+                ++j)
             {
-                if (cfg->zones[j].name &&
-                    std::strcmp(z.name, cfg->zones[j].name) == 0)
+                if(cfg->zones[j].name &&
+                std::strcmp(
+                    z.name,
+                    cfg->zones[j].name
+                ) == 0)
                 {
                     LOG_EF(
                         "SecurityOrchestrator",
@@ -2423,13 +2687,12 @@ private:
                     return false;
                 }
 
-                // stessa statusArea assegnata a due zone
-                if (cfg->zones[j].statusArea == z.statusArea)
+                if(cfg->zones[j].statusArea ==
+                z.statusArea)
                 {
                     LOG_EF(
                         "SecurityOrchestrator",
-                        "Validate: duplicated zone statusArea=%d "
-                        "('%s' and '%s')",
+                        "Validate: duplicated zone statusArea=%d ('%s' and '%s')",
                         z.statusArea,
                         z.name,
                         cfg->zones[j].name
@@ -2438,16 +2701,16 @@ private:
                 }
             }
 
-            // collisione zona -> sensor statusArea
-            for (size_t j = 0; j < cfg->count; ++j)
+            for(size_t j = 0;
+                j < cfg->count;
+                ++j)
             {
-                if (cfg->sensors[j].statusArea >= 0 &&
-                    cfg->sensors[j].statusArea == z.statusArea)
+                if(cfg->sensors[j].statusArea >= 0 &&
+                cfg->sensors[j].statusArea == z.statusArea)
                 {
                     LOG_EF(
                         "SecurityOrchestrator",
-                        "Validate: zone '%s' statusArea=%d "
-                        "collides with sensor '%s'",
+                        "Validate: zone '%s' statusArea=%d collides with sensor '%s'",
                         z.name,
                         z.statusArea,
                         cfg->sensors[j].name
@@ -2456,14 +2719,12 @@ private:
                 }
             }
 
-            // collisione zona -> system status
-            if (cfg->statusArea >= 0 &&
-                z.statusArea == cfg->statusArea)
+            if(cfg->statusArea >= 0 &&
+            z.statusArea == cfg->statusArea)
             {
                 LOG_EF(
                     "SecurityOrchestrator",
-                    "Validate: zone '%s' statusArea=%d "
-                    "collides with security statusArea",
+                    "Validate: zone '%s' statusArea=%d collides with security statusArea",
                     z.name,
                     z.statusArea
                 );
@@ -2475,9 +2736,9 @@ private:
         // GLOBAL SECURITY AREAS
         // --------------------------------------------------------
 
-        if (cfg->statusArea >= 0 &&
-            cfg->panelCommandArea >= 0 &&
-            cfg->statusArea == cfg->panelCommandArea)
+        if(cfg->statusArea >= 0 &&
+        cfg->panelCommandArea >= 0 &&
+        cfg->statusArea == cfg->panelCommandArea)
         {
             LOG_EF(
                 "SecurityOrchestrator",
@@ -2487,9 +2748,9 @@ private:
             return false;
         }
 
-        if (cfg->eventArea >= 0 &&
-            cfg->statusArea >= 0 &&
-            cfg->eventArea == cfg->statusArea)
+        if(cfg->eventArea >= 0 &&
+        cfg->statusArea >= 0 &&
+        cfg->eventArea == cfg->statusArea)
         {
             LOG_EF(
                 "SecurityOrchestrator",
@@ -2499,9 +2760,9 @@ private:
             return false;
         }
 
-        if (cfg->eventArea >= 0 &&
-            cfg->panelCommandArea >= 0 &&
-            cfg->eventArea == cfg->panelCommandArea)
+        if(cfg->eventArea >= 0 &&
+        cfg->panelCommandArea >= 0 &&
+        cfg->eventArea == cfg->panelCommandArea)
         {
             LOG_EF(
                 "SecurityOrchestrator",
@@ -2512,62 +2773,58 @@ private:
         }
 
         // --------------------------------------------------------
-        // SENSOR COMMAND / STATUS AREA COLLISIONS
+        // SENSOR COMMAND / STATUS COLLISIONS
         // --------------------------------------------------------
 
-        for (size_t i = 0; i < cfg->count; ++i)
+        for(size_t i = 0; i < cfg->count; ++i)
         {
             const auto& s = cfg->sensors[i];
 
-            if (s.cmdArea < 0)
+            if(s.cmdArea < 0)
                 continue;
 
-            if (s.statusArea >= 0 &&
-                s.cmdArea == s.statusArea)
+            if(s.statusArea >= 0 &&
+            s.cmdArea == s.statusArea)
             {
                 LOG_EF(
                     "SecurityOrchestrator",
-                    "Validate: sensor '%s' cmdArea=%d "
-                    "collides with its statusArea",
+                    "Validate: sensor '%s' cmdArea=%d collides with its statusArea",
                     s.name,
                     s.cmdArea
                 );
                 return false;
             }
 
-            if (cfg->statusArea >= 0 &&
-                s.cmdArea == cfg->statusArea)
+            if(cfg->statusArea >= 0 &&
+            s.cmdArea == cfg->statusArea)
             {
                 LOG_EF(
                     "SecurityOrchestrator",
-                    "Validate: sensor '%s' cmdArea=%d "
-                    "collides with security statusArea",
+                    "Validate: sensor '%s' cmdArea=%d collides with security statusArea",
                     s.name,
                     s.cmdArea
                 );
                 return false;
             }
 
-            if (cfg->eventArea >= 0 &&
-                s.cmdArea == cfg->eventArea)
+            if(cfg->eventArea >= 0 &&
+            s.cmdArea == cfg->eventArea)
             {
                 LOG_EF(
                     "SecurityOrchestrator",
-                    "Validate: sensor '%s' cmdArea=%d "
-                    "collides with eventArea",
+                    "Validate: sensor '%s' cmdArea=%d collides with eventArea",
                     s.name,
                     s.cmdArea
                 );
                 return false;
             }
 
-            if (cfg->panelCommandArea >= 0 &&
-                s.cmdArea == cfg->panelCommandArea)
+            if(cfg->panelCommandArea >= 0 &&
+            s.cmdArea == cfg->panelCommandArea)
             {
                 LOG_EF(
                     "SecurityOrchestrator",
-                    "Validate: sensor '%s' cmdArea=%d "
-                    "collides with panelCommandArea",
+                    "Validate: sensor '%s' cmdArea=%d collides with panelCommandArea",
                     s.name,
                     s.cmdArea
                 );
@@ -2578,28 +2835,60 @@ private:
         return true;
     }
 
-
 public:
     // ============================================================
-    // RESET SELECTED ALARM MEMORY
+    // RESET MEMORIA ALLARMI
+    //
+    // Reset della memoria centrale + memoria bitmask.
+    // Le memorie dei sensori rimangono indipendenti.
     // ============================================================
 
     static void ResetAlarmMemory(
         uint64_t mask)
     {
-        alarmMask.ResetMemory(
-            mask
-        );
+        //
+        // reset memoria centrale
+        //
+        alarmMask.ResetMemory(mask);
+
+        system.ResetAlarmMemories();
+
+        //
+        // reset memoria sensori rientrati
+        //
+        auto& ws = getWiredSensors();
+
+        for(size_t i = 0; i < ws.Count(); ++i)
+        {
+            Sensor* sensor = ws.GetSensor(i);
+
+            if(!sensor)
+                continue;
+
+            const auto& out =
+                sensor->Outputs();
+
+            if(!out.rt &&
+            !out.h24)
+            {
+                sensor->Reset();
+            }
+        }
+
+        pendingChanges |=
+            CHANGE_SYSTEM |
+            CHANGE_ZONE |
+            CHANGE_COMMAND |
+            CHANGE_SENSOR;
     }
-    
+
     // ============================================================
     // SETUP
     // ============================================================
-
-    static void Setup(
-        const FrontendConfig::Security* cfg)
+    
+    static void Setup(const FrontendConfig::Security* cfg)
     {
-        if (!validate(cfg))
+        if(!validate(cfg))
         {
             LOG_EF(
                 "SecurityOrchestrator",
@@ -2610,17 +2899,9 @@ public:
             return;
         }
 
-        if (!cfg)
-        {
-            initialized = false;
-            return;
-        }
-
         cfgCopy = *cfg;
-
-        // ============================================================
-        // WIRED SENSORS / ZONES
-        // ============================================================
+        pendingChanges = CHANGE_NONE;
+        initialized = false;
 
         ws.Init(
             cfg->sensors,
@@ -2628,37 +2909,53 @@ public:
             cfg->startupInhibitMs
         );
 
-        // ============================================================
-        // ZONE -> HMI STATUS AREA
-        // ============================================================
+        for(size_t i = 0;
+            i < ws.Count();
+            ++i)
+        {
+            Sensor* sensor =
+                ws.GetSensor(i);
 
-        if (cfg->zones &&
-            cfg->zoneCount > 0)
+            if(sensor)
+                sensor->Enable(true);
+        }
+
+        ws.Zones().EnableAll(true);
+
+        boardFaults.Setup(
+            ws,
+            [](int area) -> bool
+            {
+                return DomoManager::instance &&
+                    DomoManager::instance->isAreaInError(area);
+            }
+        );
+
+        if(cfg->zones && cfg->zoneCount > 0)
         {
             auto& zoneManager =
                 ws.Zones();
 
-            for (size_t i = 0;
+            for(size_t i = 0;
                 i < cfg->zoneCount;
                 ++i)
             {
                 const auto& zoneCfg =
                     cfg->zones[i];
 
-                if (!zoneCfg.name)
+                if(!zoneCfg.name ||
+                zoneCfg.statusArea < 0)
+                {
                     continue;
+                }
 
-                if (zoneCfg.statusArea < 0)
-                    continue;
-
-                if (!zoneManager.SetZoneStatusArea(
-                        zoneCfg.name,
-                        zoneCfg.statusArea))
+                if(!zoneManager.SetZoneStatusArea(
+                    zoneCfg.name,
+                    zoneCfg.statusArea))
                 {
                     LOG_EF(
                         "SecurityOrchestrator",
-                        "Zone status area not assigned: "
-                        "zone=%s area=%d",
+                        "Zone status area not assigned: zone=%s area=%d",
                         zoneCfg.name,
                         zoneCfg.statusArea
                     );
@@ -2666,11 +2963,7 @@ public:
             }
         }
 
-        // --------------------------------------------------------
-        // ALARM BITMASK MAP
-        // --------------------------------------------------------
-
-        if (!alarmMask.BuildMap(ws))
+        if(!alarmMask.BuildMap(ws))
         {
             LOG_EF(
                 "SecurityOrchestrator",
@@ -2681,64 +2974,16 @@ public:
             return;
         }
 
-       // --------------------------------------------------------
-        // DEFAULT SECURITY STATE
-        // --------------------------------------------------------
-        //
-        // SENSORI:
-        //   ENABLE  = true
-        //   ENGAGE  = non modificato
-        //
-        // ZONE:
-        //   ENABLE  = true
-        //   ENGAGE  = non modificato
-        //
-        // L'ENGAGE viene deciso successivamente
-        // dallo stato della centrale.
-        // --------------------------------------------------------
-
         alarmMask.SetEngage(true);
-
-        // --------------------------------------------------------
-        // SENSORI ABILITATI DI DEFAULT
-        // --------------------------------------------------------
-
-        for (size_t i = 0;
-            i < ws.Count();
-            ++i)
-        {
-            Sensor* sensor =
-                ws.GetSensor(i);
-
-            if (!sensor)
-                continue;
-
-            sensor->Enable(true);
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Setup: sensor[%u] ENABLED by default",
-                (unsigned)i
-            );
-        }
-
-        // --------------------------------------------------------
-        // ZONE ABILITATE DI DEFAULT
-        // --------------------------------------------------------
-
-        ws.Zones().EnableAll(true);
-
-        // NON fare EngageAll(true) qui.
-        // L'engage delle zone viene deciso dalla centrale.
 
         initialized = true;
 
-        lastChanges = CHANGE_NONE;
-        lastLoopAt = 0;
+        lastChanges =
+            CHANGE_SENSOR |
+            CHANGE_ZONE |
+            CHANGE_SYSTEM;
 
-        // --------------------------------------------------------
-        // ALARM MASK CALLBACK
-        // --------------------------------------------------------
+        lastLoopAt = 0;
 
         alarmMask.SetCallback(
             [](uint64_t newMask,
@@ -2748,234 +2993,179 @@ public:
             size_t sensorIndex,
             SensorChannelType type)
             {
-                LOG_DF(
-                    "SecurityOrchestrator",
-                    "NEW SIGNAL ALARM: "
-                    "new=0x%llX current=0x%llX mem=0x%llX "
-                    "bit=%u sensor=%u type=%u",
-                    (unsigned long long)newMask,
-                    (unsigned long long)currentMask,
-                    (unsigned long long)memMask,
-                    (unsigned)bitIndex,
-                    (unsigned)sensorIndex,
-                    (unsigned)type
-                );
+                (void)newMask;
+                (void)currentMask;
+                (void)memMask;
+                (void)bitIndex;
+                (void)sensorIndex;
+                (void)type;
             }
         );
 
         LOG_IF(
             "SecurityOrchestrator",
-            "Setup: sensors=%u "
-            "zones=%u "
-            "startupInhibit=%u ms",
+            "Setup: sensors=%u zones=%u startupInhibit=%u ms",
             (unsigned)cfg->count,
             (unsigned)cfg->zoneCount,
             (unsigned)cfg->startupInhibitMs
         );
+
+        LOG_IF(
+            "SecurityOrchestrator",
+            "Setup: initial anomalies sensors=%u zones=%u",
+            (unsigned)boardFaults.GetSensorAnomalyCount(),
+            (unsigned)boardFaults.GetZoneAnomalyCount()
+        );
     }
+
+    // ============================================================
+    // AREA ERROR EVENT
+    //
+    // Chiamata SOLO quando DomoManager / DMRuntime comunica
+    // il cambio di stato di errore di una area hardware.
+    // ============================================================
+    
+    static bool NotifyAreaErrorChanged(int area)
+    {
+        if(!initialized || area<0)
+            return false;
+
+        if(!boardFaults.UpdateArea(ws,area))
+            return false;
+
+        pendingChanges |= CHANGE_SENSOR | CHANGE_ZONE;
+
+        return true;
+    }
+
 
 
     // ============================================================
     // LOOP
-    //
-    // Restituisce un bitmask che indica cosa è cambiato.
-    //
-    // CHANGE_SENSOR
-    //     variazione rilevata da WiredSensorsManager::Process()
-    //
-    // CHANGE_ZONE
-    //     variazione dello stato delle zone
-    //
-    // CHANGE_SYSTEM
-    //     variazione del SystemManager
     // ============================================================
-
+ 
     static uint8_t Loop(
-        unsigned long now)
+        unsigned long now,
+        bool alarmEngaged)
     {
-        if (!initialized)
+        if(!initialized)
         {
-            lastChanges =
-                CHANGE_NONE;
-
+            lastChanges = CHANGE_NONE;
             return CHANGE_NONE;
         }
 
         uint8_t changes =
-            CHANGE_NONE;
+            pendingChanges;
 
-        // --------------------------------------------------------
-        // WIRED SENSORS / READERS
-        // --------------------------------------------------------
+        pendingChanges =
+            CHANGE_NONE;
 
         const auto sensorResult =
             ws.Process(now);
 
-        if (sensorResult.changed)
-        {
-            changes |=
-                CHANGE_SENSOR;
-        }
+        if(sensorResult.changed)
+            changes |= CHANGE_SENSOR;
 
-        if (sensorResult.zoneChanged)
-        {
-            changes |=
-                CHANGE_ZONE;
-        }
-
-        // --------------------------------------------------------
-        // ZONES / ALARMS
-        // --------------------------------------------------------
+        if(sensorResult.zoneChanged)
+            changes |= CHANGE_ZONE;
 
         auto& zones =
             ws.Zones();
 
-        if (zones.ProcessAllTypes())
+        if(zones.ProcessAllTypes())
         {
             changes |=
-                CHANGE_SENSOR;
-
-            changes |=
+                CHANGE_SENSOR |
                 CHANGE_ZONE;
         }
 
-        // --------------------------------------------------------
-        // SYSTEM AGGREGATE
-        // --------------------------------------------------------
+        // Le anomalie cambiano realmente in seguito a:
+        // - variazioni hardware
+        // - cambi di stato dei sensori
+        // Non serve ricalcolarle ad ogni ciclo senza variazioni.
+        if(changes & CHANGE_SENSOR)
+        {
+            if(boardFaults.RefreshZoneAnomaly(ws))
+                changes |= CHANGE_ZONE;
+        }
 
-        system.ComputeFrom(ws);
+        const bool boardTrouble =
+            boardFaults.GetEnabledSensorAnomalyCount(ws) > 0 ||
+            boardFaults.GetEnabledZoneAnomalyCount(ws) > 0;
 
-        // --------------------------------------------------------
-        // ALARM MASK
-        //
-        // Engage è configurato una sola volta in Setup().
-        // --------------------------------------------------------
+        system.ComputeFrom(
+            ws,
+            boardTrouble,
+            alarmEngaged
+        );
 
         alarmMask.ComputeCurrent(ws);
 
-        // --------------------------------------------------------
-        // SYSTEM CHANGE
-        // --------------------------------------------------------
-
-        if (system.hasChanged())
+        if(system.hasChanged())
         {
             changes |=
-                CHANGE_SYSTEM;
-
-            changes |=
+                CHANGE_SYSTEM |
                 CHANGE_ZONE;
         }
 
-        // --------------------------------------------------------
-        // SAVE LOOP STATE
-        // --------------------------------------------------------
-
-        lastChanges =
-            changes;
-
-        lastLoopAt =
-            now;
+        lastChanges = changes;
+        lastLoopAt = now;
 
         return changes;
     }
 
-
     // ============================================================
     // COMMANDS
     // ============================================================
-
-    // ------------------------------------------------------------
-    // ALARM PANEL
-    //
-    // Implementazione lasciata dopo la definizione completa
-    // di DomoManagerAlarmPanel.
-    // ------------------------------------------------------------
-
-    static bool ApplyPanelCommand(
-        int area,
-        long value);
-
-    static bool ApplyPanelBitCommand(
-        int area,
-        long value);
-
-    // ------------------------------------------------------------
-    // SINGLE SENSOR
-    //
-    // value:
-    //
-    //   bit 0 = Enable
-    //   bit 1 = Engage
-    //
-    // Restituisce true se l'area appartiene effettivamente
-    // ad un comando sensore e il comando è stato applicato.
-    // ------------------------------------------------------------
+    static bool ApplyPanelCommand(int area,long value);
+    static bool ApplyPanelBitCommand(int area,long value);
 
     static bool ApplySecurityCommand(
         int area,
         long value)
     {
-        if (!initialized)
+        if(!initialized ||
+        !DomoManager::instance)
+        {
             return false;
-
-
-        auto* dm =
-            DomoManager::instance;
-
-
-        if (!dm)
-            return false;
-
+        }
 
         auto& buffer =
-            dm->getBuffer();
-
+            DomoManager::instance->getBuffer();
 
         const auto* cfg =
             ws.GetConfig();
 
-
-        if (!cfg)
-            return false;
-
-
-        if (area < 0 ||
-            area >= buffer.size())
+        if(!cfg ||
+        area < 0 ||
+        area >= buffer.size())
         {
             return false;
         }
 
 
-        for (size_t i = 0;
-             i < ws.Count();
-             ++i)
+        // ============================================================
+        // SENSOR COMMAND
+        // ============================================================
+
+        for(size_t i = 0;
+            i < ws.Count();
+            ++i)
         {
             const auto& c =
                 cfg[i];
 
-
-            // ----------------------------------------------------
-            // NOT THIS SENSOR
-            // ----------------------------------------------------
-
-            if (c.cmdArea != area)
+            if(c.cmdArea != area)
                 continue;
 
-
-            Sensor* s =
+            Sensor* sensor =
                 ws.GetSensor(i);
 
-
-            if (!s)
+            if(!sensor)
                 return false;
 
-
-            // --------------------------------------------------------
-            // COMMAND DECODE
-            // --------------------------------------------------------
-
             const bool enable =
-                bitRead(value, 0);
+                !bitRead(value, 0);
 
             const bool engageRT =
                 bitRead(value, 1);
@@ -2983,1280 +3173,614 @@ public:
             const bool engageH24 =
                 bitRead(value, 2);
 
+            const bool wasEnabled =
+                sensor->IsEnabled();
 
-            // --------------------------------------------------------
-            // APPLY
-            // --------------------------------------------------------
+            const bool wasEngageRT =
+                sensor->IsEngagedRT();
 
-            s->Enable(enable);
+            const bool wasEngageH24 =
+                sensor->IsEngagedH24();
 
-            s->EngageRT(engageRT);
-            s->EngageH24(engageH24);
+            sensor->Enable(enable);
+            sensor->EngageRT(engageRT);
+            sensor->EngageH24(engageH24);
 
+            if(wasEnabled && !enable)
+                alarmMask.ClearSensor(i);
 
-            LOG_IF(
-                "SecurityOrchestrator",
-                "ApplySecurityCommand: "
-                "sensor[%u] zone=%s "
-                "enable=%d engageRT=%d engageH24=%d area=%d",
-                (unsigned)i,
-                c.zone ? c.zone : "?",
-                enable ? 1 : 0,
-                engageRT ? 1 : 0,
-                engageH24 ? 1 : 0,
-                area
-            );
+            const bool changed =
+                wasEnabled != enable ||
+                wasEngageRT != engageRT ||
+                wasEngageH24 != engageH24;
 
+            if(changed)
+            {
+                pendingChanges |=
+                    CHANGE_SENSOR |
+                    CHANGE_ZONE |
+                    CHANGE_SYSTEM |
+                    CHANGE_COMMAND;
+            }
 
             return true;
         }
 
 
+        // ============================================================
+        // ZONE COMMAND
+        //
+        // bit 0 = ENABLE
+        //
+        // 0 = DISABLE ZONE
+        // 1 = ENABLE ZONE
+        // ============================================================
+
+        const FrontendConfig::Security& securityCfg =
+            getConfig();
+
+        for(size_t i = 0;
+            i < securityCfg.zoneCount;
+            ++i)
+        {
+            const auto& zoneCfg =
+                securityCfg.zones[i];
+
+            if(zoneCfg.cmdArea != area)
+                continue;
+
+            if(!zoneCfg.name)
+                return false;
+
+            const bool enable = !bitRead(value, 0);
+
+            const bool wasEnabled =
+                ws.Zones().IsZoneEnabled(
+                    zoneCfg.name);
+
+            if(!ws.Zones().EnableZone(
+                    zoneCfg.name,
+                    enable))
+            {
+                return false;
+            }
+
+            const bool changed =
+                wasEnabled != enable;
+
+            if(changed)
+            {
+                pendingChanges |=
+                    CHANGE_SENSOR |
+                    CHANGE_ZONE |
+                    CHANGE_SYSTEM |
+                    CHANGE_COMMAND;
+            }
+
+            return true;
+        }
+
         return false;
     }
 
-
-    // ------------------------------------------------------------
+    // ============================================================
     // FORCE SECURITY COMMANDS
-    // ------------------------------------------------------------
-
+    // ============================================================
+    
     static void ForceSecurityCommands(
         AlarmPanelInterface::ArmState state,
         unsigned long now)
     {
-        auto& zoneManager =
-            ws.Zones();
-
-        bool engageRT = false;
-        bool engageH24 = false;
-
-        switch (state)
-        {
-            case AlarmPanelInterface::ArmState::ARMED_AWAY:
-                engageRT = true;
-                engageH24 = true;
-                break;
-
-            case AlarmPanelInterface::ArmState::ARMED_STAY:
-            case AlarmPanelInterface::ArmState::ARMED_NIGHT:
-                engageRT = false;
-                engageH24 = true;
-                break;
-
-            case AlarmPanelInterface::ArmState::DISARMED:
-            default:
-                engageRT = false;
-                engageH24 = false;
-                break;
-        }
-
-        // Zone abilitate = engaged.
-        const bool zoneEngage =
-            state !=
-            AlarmPanelInterface::ArmState::DISARMED;
-
-        for (auto& entry : zoneManager.zones)
-        {
-            if (!entry.second.enabled)
-            {
-                entry.second.engaged = false;
-                continue;
-            }
-
-            entry.second.engaged =
-                zoneEngage;
-        }
+        auto& zoneManager = ws.Zones();
 
         const auto* cfg =
             ws.GetConfig();
 
-        if (!cfg)
-            return;
+        const bool zoneEngage =
+            state != AlarmPanelInterface::ArmState::DISARMED;
 
-        for (size_t i = 0;
+        for(auto& entry : zoneManager.zones)
+        {
+            entry.second.engaged =
+                entry.second.enabled &&
+                zoneEngage;
+        }
+
+        for(size_t i = 0;
             i < ws.Count();
             ++i)
         {
             Sensor* sensor =
                 ws.GetSensor(i);
 
-            if (!sensor)
+            if(!sensor)
                 continue;
 
-            if (!sensor->IsEnabled())
+            if(!sensor->IsEnabled())
             {
                 sensor->EngageRT(false);
                 sensor->EngageH24(false);
                 continue;
             }
 
-            sensor->EngageRT(
-                engageRT
-            );
+            bool engageRT  = false;
+            bool engageH24 = false;
 
-            sensor->EngageH24(
-                engageH24
-            );
+            const SensorCategory category =
+                (cfg != nullptr)
+                    ? cfg[i].category
+                    : SensorCategory::OTHER;
 
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Sensor[%u] zone=%s RT_ENGAGE=%d H24_ENGAGE=%d",
-                (unsigned)i,
-                cfg[i].zone
-                    ? cfg[i].zone
-                    : "<none>",
-                engageRT ? 1 : 0,
-                engageH24 ? 1 : 0
-            );
+            if(category == SensorCategory::TAMPER ||
+            category == SensorCategory::PANIC)
+            {
+                sensor->EngageRT(true);
+                sensor->EngageH24(true);
+                continue;
+            }
 
-            // Se vuoi mantenere sincronizzato il comando HMI,
-            // il prossimo passo è definire i due bit di engage
-            // nella cmdArea del sensore.
+            switch(state)
+            {
+                case AlarmPanelInterface::ArmState::ARMED_AWAY:
+                {
+                    engageRT  = true;
+                    engageH24 = true;
+                    break;
+                }
+
+                case AlarmPanelInterface::ArmState::ARMED_STAY:
+                {
+                    //
+                    // Manteniamo il comportamento originale
+                    //
+                    engageRT  = false;
+                    engageH24 = true;
+                    break;
+                }
+
+                case AlarmPanelInterface::ArmState::ARMED_NIGHT:
+                {
+                    engageH24 = true;
+
+                    switch(category)
+                    {
+                        //
+                        // PIR esclusi di notte
+                        //
+                        case SensorCategory::PIR:
+                            engageRT = false;
+                            break;
+
+                        //
+                        // Porte e finestre devono allarmare
+                        //
+                        case SensorCategory::DOOR:
+                        case SensorCategory::WINDOW:
+                            engageRT = true;
+                            break;
+
+                        //
+                        // Sensori tecnologici
+                        //
+                        case SensorCategory::FLOOD:
+                        case SensorCategory::SMOKE:
+                        case SensorCategory::TAMPER:
+                        case SensorCategory::PANIC:
+                            engageRT = true;
+                            break;
+
+                        default:
+                            engageRT = true;
+                            break;
+                    }
+
+                    break;
+                }
+
+                case AlarmPanelInterface::ArmState::DISARMED:
+                default:
+                {
+                    engageRT  = false;
+                    engageH24 = false;
+                    break;
+                }
+            }
+
+            sensor->EngageRT(engageRT);
+            sensor->EngageH24(engageH24);
         }
-
-        LOG_IF(
-            "SecurityOrchestrator",
-            "Security arm state=%u RT_ENGAGE=%d H24_ENGAGE=%d",
-            (unsigned)state,
-            engageRT ? 1 : 0,
-            engageH24 ? 1 : 0
-        );
 
         (void)now;
     }
 
-
+    static uint64_t GetEffectiveAlarmMemoryMask()
+    {
+        return alarmMask.GetEffectiveMemoryMask();
+    }
 
     // ============================================================
     // DIAGNOSTICA
     // ============================================================
-
     class Diagnostic
     {
     private:
-
-        // --------------------------------------------------------
-        // HEADER
-        // --------------------------------------------------------
-
-        static void Header(
-            const char* title)
+        static void Header(const char* title)
         {
-            LOG_IF(
-                "SecurityOrchestrator",
-                "================================================"
-            );
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "%s",
-                title
-            );
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "================================================"
-            );
+            LOG_IF("SecurityOrchestrator","================================================");
+            LOG_IF("SecurityOrchestrator","%s",title);
+            LOG_IF("SecurityOrchestrator","================================================");
         }
-
-
-        // --------------------------------------------------------
-        // FOOTER
-        // --------------------------------------------------------
 
         static void Footer()
         {
-            LOG_IF(
-                "SecurityOrchestrator",
-                "================================================"
-            );
+            LOG_IF("SecurityOrchestrator","================================================");
         }
 
-
     public:
-
-        // ========================================================
-        // CONFIG
-        // ========================================================
-
         static void ReportConfig()
         {
-            // ============================================================
-            // HEADER
-            // ============================================================
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "==============================================="
-            );
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "      SECURITY ORCHESTRATOR CONFIG REPORT"
-            );
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "==============================================="
-            );
-
-
-            // ============================================================
-            // INITIALIZATION
-            // ============================================================
+            LOG_IF("SecurityOrchestrator","===============================================");
+            LOG_IF("SecurityOrchestrator","      SECURITY ORCHESTRATOR CONFIG REPORT");
+            LOG_IF("SecurityOrchestrator","===============================================");
 
             if (!SecurityOrchestrator::isInitialized())
             {
-                LOG_IF(
-                    "SecurityOrchestrator",
-                    "Initialized        : NO"
-                );
-
-                LOG_IF(
-                    "SecurityOrchestrator",
-                    "==============================================="
-                );
-
+                LOG_IF("SecurityOrchestrator","Initialized        : NO");
+                LOG_IF("SecurityOrchestrator","===============================================");
                 return;
             }
 
-
-            // ============================================================
-            // REFERENCES
-            // ============================================================
-
-            const auto& securityCfg =
-                SecurityOrchestrator::cfgCopy;
-
-            const auto& ws =
-                SecurityOrchestrator::getWiredSensors();
-
-            const auto* sensorCfg =
-                ws.GetConfig();
-
-
-            // ============================================================
-            // AREA COUNTERS
-            // ============================================================
+            const auto& securityCfg = SecurityOrchestrator::cfgCopy;
+            const auto& ws = SecurityOrchestrator::getWiredSensors();
+            const auto* sensorCfg = ws.GetConfig();
 
             size_t commandAreaCount = 0;
             size_t sensorStatusAreaCount = 0;
 
-
             if (sensorCfg)
             {
-                for (size_t i = 0;
-                    i < ws.Count();
-                    ++i)
+                for (size_t i = 0; i < ws.Count(); ++i)
                 {
-                    const auto& sensor =
-                        sensorCfg[i];
-
-                    if (sensor.cmdArea >= 0)
-                        ++commandAreaCount;
-
-                    if (sensor.statusArea >= 0)
-                        ++sensorStatusAreaCount;
+                    const auto& sensor = sensorCfg[i];
+                    if (sensor.cmdArea >= 0) ++commandAreaCount;
+                    if (sensor.statusArea >= 0) ++sensorStatusAreaCount;
                 }
             }
 
+            LOG_IF("SecurityOrchestrator","-----------------------------------------------");
+            LOG_IF("SecurityOrchestrator","SECURITY GLOBAL CONFIGURATION");
+            LOG_IF("SecurityOrchestrator","Enabled            : %s",securityCfg.enabled?"YES":"NO");
+            LOG_IF("SecurityOrchestrator","Interval            : %lu ms",(unsigned long)securityCfg.intervalMs);
+            LOG_IF("SecurityOrchestrator","Report on change    : %s",securityCfg.reportOnChange?"YES":"NO");
+            LOG_IF("SecurityOrchestrator","Startup inhibit     : %lu ms",(unsigned long)securityCfg.startupInhibitMs);
+            LOG_IF("SecurityOrchestrator","System status area  : %d",securityCfg.statusArea);
+            LOG_IF("SecurityOrchestrator","Event area          : %d",securityCfg.eventArea);
+            LOG_IF("SecurityOrchestrator","Panel command area  : %d",securityCfg.panelCommandArea);
 
-            // ============================================================
-            // SECURITY GLOBAL CONFIGURATION
-            // ============================================================
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "-----------------------------------------------"
-            );
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "SECURITY GLOBAL CONFIGURATION"
-            );
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Enabled            : %s",
-                securityCfg.enabled
-                    ? "YES"
-                    : "NO"
-            );
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Interval            : %lu ms",
-                (unsigned long)securityCfg.intervalMs
-            );
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Report on change    : %s",
-                securityCfg.reportOnChange
-                    ? "YES"
-                    : "NO"
-            );
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Startup inhibit     : %lu ms",
-                (unsigned long)securityCfg.startupInhibitMs
-            );
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "System status area  : %d",
-                securityCfg.statusArea
-            );
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Event area          : %d",
-                securityCfg.eventArea
-            );
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Panel command area  : %d",
-                securityCfg.panelCommandArea
-            );
-
-
-            // ============================================================
-            // WIRED SENSOR CONFIGURATION
-            // ============================================================
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "-----------------------------------------------"
-            );
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "WIRED SENSORS"
-            );
-
+            LOG_IF("SecurityOrchestrator","-----------------------------------------------");
+            LOG_IF("SecurityOrchestrator","WIRED SENSORS");
 
             if (!sensorCfg)
             {
-                LOG_IF(
-                    "SecurityOrchestrator",
-                    "Sensor configuration: NULL"
-                );
+                LOG_IF("SecurityOrchestrator","Sensor configuration: NULL");
             }
             else
             {
-                LOG_IF(
-                    "SecurityOrchestrator",
-                    "Sensors configured  : %u",
-                    (unsigned)ws.Count()
-                );
+                LOG_IF("SecurityOrchestrator","Sensors configured  : %u",(unsigned)ws.Count());
 
-
-                for (size_t i = 0;
-                    i < ws.Count();
-                    ++i)
+                for (size_t i = 0; i < ws.Count(); ++i)
                 {
-                    const auto& sensor =
-                        sensorCfg[i];
+                    const auto& sensor = sensorCfg[i];
+                    const Sensor* runtimeSensor = ws.GetSensor(i);
 
-
-                    Sensor* runtimeSensor =
-                        ws.GetSensor(i);
-
-
-                    // ----------------------------------------------------
-                    // SENSOR BASIC CONFIGURATION
-                    // ----------------------------------------------------
-
-                    LOG_IF(
-                        "SecurityOrchestrator",
+                    LOG_IF("SecurityOrchestrator",
                         "Sensor[%u] | name=%s | zone=%s | category=%u",
                         (unsigned)i,
-                        sensor.name
-                            ? sensor.name
-                            : "<null>",
-                        sensor.zone
-                            ? sensor.zone
-                            : "<null>",
-                        (unsigned)sensor.category
-                    );
-
-
-                    // ----------------------------------------------------
-                    // RUNTIME SENSOR STATE
-                    // ----------------------------------------------------
+                        sensor.name ? sensor.name : "<null>",
+                        sensor.zone ? sensor.zone : "<null>",
+                        (unsigned)sensor.category);
 
                     if (runtimeSensor)
                     {
-                        LOG_IF(
-                            "SecurityOrchestrator",
+                        LOG_IF("SecurityOrchestrator",
                             "  runtime: ENABLED=%s | ENGAGE_RT=%s | ENGAGE_H24=%s | ALARM=%s",
-                            runtimeSensor->IsEnabled()
-                                ? "YES"
-                                : "NO",
-
-                            runtimeSensor->IsEngagedRT()
-                                ? "YES"
-                                : "NO",
-
-                            runtimeSensor->IsEngagedH24()
-                                ? "YES"
-                                : "NO",
-
-                            (runtimeSensor->Outputs().rt ||
-                            runtimeSensor->Outputs().h24)
-                                ? "YES"
-                                : "NO"
-                        );
+                            runtimeSensor->IsEnabled()?"YES":"NO",
+                            runtimeSensor->IsEngagedRT()?"YES":"NO",
+                            runtimeSensor->IsEngagedH24()?"YES":"NO",
+                            (runtimeSensor->Outputs().rt || runtimeSensor->Outputs().h24)?"YES":"NO");
                     }
                     else
                     {
-                        LOG_IF(
-                            "SecurityOrchestrator",
-                            "  runtime: INVALID SENSOR"
-                        );
+                        LOG_IF("SecurityOrchestrator","  runtime: INVALID SENSOR");
                     }
 
-
-                    // ----------------------------------------------------
-                    // AREAS
-                    // ----------------------------------------------------
-
-                    LOG_IF(
-                        "SecurityOrchestrator",
+                    LOG_IF("SecurityOrchestrator",
                         "  cmdArea=%d | statusArea=%d",
-                        sensor.cmdArea,
-                        sensor.statusArea
-                    );
+                        sensor.cmdArea,sensor.statusArea);
 
-
-                    // ----------------------------------------------------
-                    // CHANNELS / READERS
-                    // ----------------------------------------------------
-
-                    LOG_IF(
-                        "SecurityOrchestrator",
+                    LOG_IF("SecurityOrchestrator",
                         "  channels=%u | readers=%u",
                         (unsigned)sensor.channels.size(),
-                        (unsigned)sensor.readers.size()
-                    );
-
+                        (unsigned)sensor.readers.size());
 
                     size_t channelIndex = 0;
-
-                    for (const auto& channel :
-                        sensor.channels)
+                    for (const auto& channel : sensor.channels)
                     {
-                        LOG_IF(
-                            "SecurityOrchestrator",
+                        LOG_IF("SecurityOrchestrator",
                             "    channel[%u] type=%u pin=%d",
                             (unsigned)channelIndex,
                             (unsigned)channel.type,
-                            channel.pin
-                        );
-
+                            channel.pin);
                         ++channelIndex;
                     }
 
-
                     size_t readerIndex = 0;
-
-                    for (const auto& reader :
-                        sensor.readers)
+                    for (const auto& reader : sensor.readers)
                     {
-                        LOG_IF(
-                            "SecurityOrchestrator",
+                        LOG_IF("SecurityOrchestrator",
                             "    reader[%u] %s",
                             (unsigned)readerIndex,
-                            reader
-                                ? "configured"
-                                : "NULL"
-                        );
-
+                            reader ? "configured" : "NULL");
                         ++readerIndex;
                     }
                 }
             }
 
-
-            // ============================================================
-            // ZONE CONFIGURATION
-            // ============================================================
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "-----------------------------------------------"
-            );
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "ZONES"
-            );
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Zones configured   : %u",
-                (unsigned)securityCfg.zoneCount
-            );
-
+            LOG_IF("SecurityOrchestrator","-----------------------------------------------");
+            LOG_IF("SecurityOrchestrator","ZONES");
+            LOG_IF("SecurityOrchestrator","Zones configured   : %u",(unsigned)securityCfg.zoneCount);
 
             if (securityCfg.zoneCount == 0)
             {
-                LOG_IF(
-                    "SecurityOrchestrator",
-                    "  No explicit zone configuration"
-                );
+                LOG_IF("SecurityOrchestrator","  No explicit zone configuration");
             }
             else if (!securityCfg.zones)
             {
-                LOG_IF(
-                    "SecurityOrchestrator",
-                    "  ERROR: zone configuration is NULL"
-                );
+                LOG_IF("SecurityOrchestrator","  ERROR: zone configuration is NULL");
             }
             else
             {
-                const auto& zones =
-                    ws.Zones();
+                const auto& zones = ws.Zones();
 
-
-                for (size_t i = 0;
-                    i < securityCfg.zoneCount;
-                    ++i)
+                for (size_t i = 0; i < securityCfg.zoneCount; ++i)
                 {
-                    const auto& zoneCfg =
-                        securityCfg.zones[i];
-
+                    const auto& zoneCfg = securityCfg.zones[i];
 
                     if (!zoneCfg.name)
                     {
-                        LOG_IF(
-                            "SecurityOrchestrator",
+                        LOG_IF("SecurityOrchestrator",
                             "Zone[%u] | name=NULL | statusArea=%d",
-                            (unsigned)i,
-                            zoneCfg.statusArea
-                        );
-
+                            (unsigned)i,zoneCfg.statusArea);
                         continue;
                     }
 
+                    const int zoneIndex = ws.GetZoneIndex(zoneCfg.name);
+                    const int runtimeStatusArea = zones.GetZoneStatusArea(zoneCfg.name);
 
-                    const int zoneIndex =
-                        ws.GetZoneIndex(
-                            zoneCfg.name
-                        );
-
-
-                    const int runtimeStatusArea =
-                        zones.GetZoneStatusArea(
-                            zoneCfg.name
-                        );
-
-
-                    LOG_IF(
-                        "SecurityOrchestrator",
-                        "Zone[%u] | name=%s | "
-                        "statusArea=%d | "
-                        "runtimeArea=%d | "
-                        "index=%d",
+                    LOG_IF("SecurityOrchestrator",
+                        "Zone[%u] | name=%s | statusArea=%d | runtimeArea=%d | index=%d",
                         (unsigned)i,
                         zoneCfg.name,
                         zoneCfg.statusArea,
                         runtimeStatusArea,
-                        zoneIndex
-                    );
+                        zoneIndex);
                 }
             }
 
+            LOG_IF("SecurityOrchestrator","-----------------------------------------------");
+            LOG_IF("SecurityOrchestrator","RUNTIME ZONE INDEX");
+            LOG_IF("SecurityOrchestrator","Runtime zones      : %u",(unsigned)ws.GetZoneCount());
 
-            // ============================================================
-            // RUNTIME ZONE INDEX
-            // ============================================================
+            const auto& runtimeZones = ws.Zones();
 
-            LOG_IF(
-                "SecurityOrchestrator",
-                "-----------------------------------------------"
-            );
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "RUNTIME ZONE INDEX"
-            );
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Runtime zones      : %u",
-                (unsigned)ws.GetZoneCount()
-            );
-
-
-            const auto& runtimeZones =
-                ws.Zones();
-
-
-            for (size_t i = 0;
-                i < ws.GetZoneCount();
-                ++i)
+            for (size_t i = 0; i < ws.GetZoneCount(); ++i)
             {
-                const char* zoneName =
-                    ws.GetZoneName(i);
-
-
+                const char* zoneName = ws.GetZoneName(i);
                 if (!zoneName)
                 {
-                    LOG_IF(
-                        "SecurityOrchestrator",
-                        "Zone[%u] | name=NULL",
-                        (unsigned)i
-                    );
-
+                    LOG_IF("SecurityOrchestrator","Zone[%u] | name=NULL",(unsigned)i);
                     continue;
                 }
 
+                const int statusArea = runtimeZones.GetZoneStatusArea(zoneName);
+                const bool enabled = runtimeZones.IsZoneEnabled(zoneName);
+                const bool engaged = runtimeZones.IsZoneEngaged(zoneName);
 
-                const int statusArea =
-                    runtimeZones.GetZoneStatusArea(
-                        zoneName
-                    );
-
-
-                const bool enabled =
-                    runtimeZones.IsZoneEnabled(
-                        zoneName
-                    );
-
-
-                const bool engaged =
-                    runtimeZones.IsZoneEngaged(
-                        zoneName
-                    );
-
-
-                LOG_IF(
-                    "SecurityOrchestrator",
-                    "Zone[%u] | "
-                    "name=%s | "
-                    "statusArea=%d | "
-                    "ENABLED=%s | "
-                    "ENGAGED=%s",
+                LOG_IF("SecurityOrchestrator",
+                    "Zone[%u] | name=%s | statusArea=%d | ENABLED=%s | ENGAGED=%s",
                     (unsigned)i,
                     zoneName,
                     statusArea,
-                    enabled
-                        ? "YES"
-                        : "NO",
-                    engaged
-                        ? "YES"
-                        : "NO"
-                );
+                    enabled?"YES":"NO",
+                    engaged?"YES":"NO");
             }
 
-
-            // ============================================================
-            // SENSOR COMMAND / STATUS AREAS
-            // ============================================================
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "-----------------------------------------------"
-            );
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "SENSOR COMMAND / STATUS AREAS"
-            );
-
+            LOG_IF("SecurityOrchestrator","-----------------------------------------------");
+            LOG_IF("SecurityOrchestrator","SENSOR COMMAND / STATUS AREAS");
 
             if (!sensorCfg)
             {
-                LOG_IF(
-                    "SecurityOrchestrator",
-                    "Sensor configuration: NULL"
-                );
+                LOG_IF("SecurityOrchestrator","Sensor configuration: NULL");
             }
             else
             {
-                for (size_t i = 0;
-                    i < ws.Count();
-                    ++i)
+                for (size_t i = 0; i < ws.Count(); ++i)
                 {
-                    const auto& sensor =
-                        sensorCfg[i];
+                    const auto& sensor = sensorCfg[i];
 
-
-                    LOG_IF(
-                        "SecurityOrchestrator",
-                        "Sensor[%u] | %-24s | zone=%-10s | "
-                        "cmdArea=%d | statusArea=%d",
+                    LOG_IF("SecurityOrchestrator",
+                        "Sensor[%u] | %-24s | zone=%-10s | cmdArea=%d | statusArea=%d",
                         (unsigned)i,
-                        sensor.name
-                            ? sensor.name
-                            : "?",
-                        sensor.zone
-                            ? sensor.zone
-                            : "?",
+                        sensor.name ? sensor.name : "?",
+                        sensor.zone ? sensor.zone : "?",
                         sensor.cmdArea,
-                        sensor.statusArea
-                    );
+                        sensor.statusArea);
                 }
             }
 
-            // ============================================================
-            // SUMMARY
-            // ============================================================
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "-----------------------------------------------"
-            );
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "SUMMARY"
-            );
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Sensors             : %u",
-                (unsigned)ws.Count()
-            );
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Runtime zones       : %u",
-                (unsigned)ws.GetZoneCount()
-            );
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Configured zones    : %u",
-                (unsigned)securityCfg.zoneCount
-            );
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Sensor cmd areas    : %u",
-                (unsigned)commandAreaCount
-            );
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Sensor status areas : %u",
-                (unsigned)sensorStatusAreaCount
-            );
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "System status area  : %d",
-                securityCfg.statusArea
-            );
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Panel command area  : %d",
-                securityCfg.panelCommandArea
-            );
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Event area          : %d",
-                securityCfg.eventArea
-            );
-
-
-            // ============================================================
-            // FOOTER
-            // ============================================================
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "==============================================="
-            );
+            LOG_IF("SecurityOrchestrator","-----------------------------------------------");
+            LOG_IF("SecurityOrchestrator","SUMMARY");
+            LOG_IF("SecurityOrchestrator","Sensors             : %u",(unsigned)ws.Count());
+            LOG_IF("SecurityOrchestrator","Runtime zones       : %u",(unsigned)ws.GetZoneCount());
+            LOG_IF("SecurityOrchestrator","Configured zones    : %u",(unsigned)securityCfg.zoneCount);
+            LOG_IF("SecurityOrchestrator","Sensor cmd areas    : %u",(unsigned)commandAreaCount);
+            LOG_IF("SecurityOrchestrator","Sensor status areas : %u",(unsigned)sensorStatusAreaCount);
+            LOG_IF("SecurityOrchestrator","System status area  : %d",securityCfg.statusArea);
+            LOG_IF("SecurityOrchestrator","Panel command area  : %d",securityCfg.panelCommandArea);
+            LOG_IF("SecurityOrchestrator","Event area          : %d",securityCfg.eventArea);
+            LOG_IF("SecurityOrchestrator","===============================================");
         }
-
-
-        // ========================================================
-        // SENSORS
-        // ========================================================
 
         static void ReportSensors()
         {
-            Header(
-                "           SECURITY ORCHESTRATOR SENSORS REPORT"
-            );
-
-
-            // ============================================================
-            // NOT INITIALIZED
-            // ============================================================
+            Header("           SECURITY ORCHESTRATOR SENSORS REPORT");
 
             if (!initialized)
             {
-                LOG_IF(
-                    "SecurityOrchestrator",
-                    "Status : NOT INITIALIZED"
-                );
-
+                LOG_IF("SecurityOrchestrator","Status : NOT INITIALIZED");
                 Footer();
                 return;
             }
 
-
-            // ============================================================
-            // CONFIGURATION
-            // ============================================================
-
-            const auto* cfg =
-                ws.GetConfig();
-
+            const auto* cfg = ws.GetConfig();
 
             if (!cfg)
             {
-                LOG_IF(
-                    "SecurityOrchestrator",
-                    "ERROR: sensor configuration unavailable"
-                );
-
+                LOG_IF("SecurityOrchestrator","ERROR: sensor configuration unavailable");
                 Footer();
                 return;
             }
 
+            size_t enabled = 0, disabled = 0, engageRT = 0, disengageRT = 0;
+            size_t engageH24 = 0, disengageH24 = 0, active = 0;
+            size_t alarmRT = 0, alarmH24 = 0, memRT = 0, memH24 = 0;
 
-            // ============================================================
-            // COUNTERS
-            // ============================================================
-
-            size_t enabled     = 0;
-            size_t disabled    = 0;
-
-            size_t engageRT    = 0;
-            size_t disengageRT = 0;
-
-            size_t engageH24    = 0;
-            size_t disengageH24 = 0;
-
-            size_t active       = 0;
-            size_t alarmRT      = 0;
-            size_t alarmH24     = 0;
-
-            size_t memRT        = 0;
-            size_t memH24       = 0;
-
-
-            // ============================================================
-            // SENSORS
-            // ============================================================
-
-            for (size_t i = 0;
-                i < ws.Count();
-                ++i)
+            for (size_t i = 0; i < ws.Count(); ++i)
             {
-                const auto& c =
-                    cfg[i];
-
-
-                Sensor* s =
-                    ws.GetSensor(i);
-
-
-                // --------------------------------------------------------
-                // INVALID SENSOR
-                // --------------------------------------------------------
+                const auto& c = cfg[i];
+                Sensor* s = ws.GetSensor(i);
 
                 if (!s)
                 {
-                    LOG_IF(
-                        "SecurityOrchestrator",
-                        "Sensor %u | INVALID SENSOR POINTER",
-                        (unsigned)i
-                    );
-
+                    LOG_IF("SecurityOrchestrator","Sensor %u | INVALID SENSOR POINTER",(unsigned)i);
                     continue;
                 }
 
+                const bool isEnabled = s->IsEnabled();
+                const bool isEngagedRT = s->IsEngagedRT();
+                const bool isEngagedH24 = s->IsEngagedH24();
+                const bool isAlarmRT = s->Outputs().rt;
+                const bool isAlarmH24 = s->Outputs().h24;
+                const bool isAlarm = isAlarmRT || isAlarmH24;
+                const bool isMemRT = s->Outputs().rtMem;
+                const bool isMemH24 = s->Outputs().h24Mem;
 
-                // --------------------------------------------------------
-                // RUNTIME STATE
-                // --------------------------------------------------------
+                if (isEnabled) ++enabled; else ++disabled;
+                if (isEngagedRT) ++engageRT; else ++disengageRT;
+                if (isEngagedH24) ++engageH24; else ++disengageH24;
+                if (isAlarm) ++active;
+                if (isAlarmRT) ++alarmRT;
+                if (isAlarmH24) ++alarmH24;
+                if (isMemRT) ++memRT;
+                if (isMemH24) ++memH24;
 
-                const bool isEnabled =
-                    s->IsEnabled();
-
-                const bool isEngagedRT =
-                    s->IsEngagedRT();
-
-                const bool isEngagedH24 =
-                    s->IsEngagedH24();
-
-                const bool isAlarmRT =
-                    s->Outputs().rt;
-
-                const bool isAlarmH24 =
-                    s->Outputs().h24;
-
-                const bool isAlarm =
-                    isAlarmRT ||
-                    isAlarmH24;
-
-                const bool isMemRT =
-                    s->Outputs().rtMem;
-
-                const bool isMemH24 =
-                    s->Outputs().h24Mem;
-
-
-                // --------------------------------------------------------
-                // COUNTERS
-                // --------------------------------------------------------
-
-                if (isEnabled)
-                    ++enabled;
-                else
-                    ++disabled;
-
-
-                if (isEngagedRT)
-                    ++engageRT;
-                else
-                    ++disengageRT;
-
-
-                if (isEngagedH24)
-                    ++engageH24;
-                else
-                    ++disengageH24;
-
-
-                if (isAlarm)
-                    ++active;
-
-
-                if (isAlarmRT)
-                    ++alarmRT;
-
-
-                if (isAlarmH24)
-                    ++alarmH24;
-
-
-                if (isMemRT)
-                    ++memRT;
-
-
-                if (isMemH24)
-                    ++memH24;
-
-
-                // --------------------------------------------------------
-                // SENSOR SUMMARY
-                // --------------------------------------------------------
-
-                LOG_IF(
-                    "SecurityOrchestrator",
-                    "Sensor %u | "
-                    "name=%s | "
-                    "zone=%s | "
-                    "category=%d | "
-                    "ENABLED=%s | "
-                    "ENGAGE_RT=%s | "
-                    "ENGAGE_H24=%s",
+                LOG_IF("SecurityOrchestrator",
+                    "Sensor %u | name=%s | zone=%s | category=%d | ENABLED=%s | ENGAGE_RT=%s | ENGAGE_H24=%s",
                     (unsigned)i,
                     c.name ? c.name : "?",
                     c.zone ? c.zone : "?",
                     static_cast<int>(c.category),
-                    isEnabled
-                        ? "YES"
-                        : "NO",
-                    isEngagedRT
-                        ? "YES"
-                        : "NO",
-                    isEngagedH24
-                        ? "YES"
-                        : "NO"
-                );
+                    isEnabled?"YES":"NO",
+                    isEngagedRT?"YES":"NO",
+                    isEngagedH24?"YES":"NO");
 
+                LOG_IF("SecurityOrchestrator",
+                    "  outputs: RT=%s | H24=%s | ALARM=%s | RT_MEM=%s | H24_MEM=%s",
+                    isAlarmRT?"YES":"NO",
+                    isAlarmH24?"YES":"NO",
+                    isAlarm?"YES":"NO",
+                    isMemRT?"YES":"NO",
+                    isMemH24?"YES":"NO");
 
-                // --------------------------------------------------------
-                // OUTPUTS
-                // --------------------------------------------------------
-
-                LOG_IF(
-                    "SecurityOrchestrator",
-                    "  outputs: "
-                    "RT=%s | "
-                    "H24=%s | "
-                    "ALARM=%s | "
-                    "RT_MEM=%s | "
-                    "H24_MEM=%s",
-                    isAlarmRT
-                        ? "YES"
-                        : "NO",
-                    isAlarmH24
-                        ? "YES"
-                        : "NO",
-                    isAlarm
-                        ? "YES"
-                        : "NO",
-                    isMemRT
-                        ? "YES"
-                        : "NO",
-                    isMemH24
-                        ? "YES"
-                        : "NO"
-                );
-
-
-                // --------------------------------------------------------
-                // AREAS
-                // --------------------------------------------------------
-
-                LOG_IF(
-                    "SecurityOrchestrator",
+                LOG_IF("SecurityOrchestrator",
                     "  cmdArea=%d | statusArea=%d",
-                    c.cmdArea,
-                    c.statusArea
-                );
-
-
-                // ========================================================
-                // CHANNELS
-                // ========================================================
+                    c.cmdArea,c.statusArea);
 
                 size_t channelIndex = 0;
-
-                for (const auto& channel :
-                    c.channels)
+                for (const auto& channel : c.channels)
                 {
-                    const SensorChannelType type =
-                        channel.type;
-
-
-                    const SensorChannel* ch =
-                        s->Get(type);
-
+                    const SensorChannelType type = channel.type;
+                    const SensorChannel* ch = s->Get(type);
 
                     if (!ch)
                     {
-                        LOG_IF(
-                            "SecurityOrchestrator",
+                        LOG_IF("SecurityOrchestrator",
                             "  channel[%u] type=%u | INVALID",
-                            (unsigned)channelIndex,
-                            (unsigned)type
-                        );
-
-                        ++channelIndex;
-                        continue;
+                            (unsigned)channelIndex,(unsigned)type);
                     }
-
-
-                    LOG_IF(
-                        "SecurityOrchestrator",
-                        "  channel[%u] type=%u | "
-                        "ACTIVE=%s | "
-                        "ALARM=%s | "
-                        "INHIBIT=%s",
-                        (unsigned)channelIndex,
-                        (unsigned)type,
-                        ch->IsActive()
-                            ? "YES"
-                            : "NO",
-                        s->ChannelAlarm(type)
-                            ? "YES"
-                            : "NO",
-                        ch->IsInhibit()
-                            ? "YES"
-                            : "NO"
-                    );
-
+                    else
+                    {
+                        LOG_IF("SecurityOrchestrator",
+                            "  channel[%u] type=%u | ACTIVE=%s | ALARM=%s | INHIBIT=%s",
+                            (unsigned)channelIndex,
+                            (unsigned)type,
+                            ch->IsActive()?"YES":"NO",
+                            s->ChannelAlarm(type)?"YES":"NO",
+                            ch->IsInhibit()?"YES":"NO");
+                    }
 
                     ++channelIndex;
                 }
             }
 
-
-            // ============================================================
-            // SUMMARY
-            // ============================================================
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "-----------------------------------------------"
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Total sensors     : %u",
-                (unsigned)ws.Count()
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Enabled sensors   : %u",
-                (unsigned)enabled
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Disabled sensors  : %u",
-                (unsigned)disabled
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "ENGAGE RT         : %u",
-                (unsigned)engageRT
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "DISENGAGE RT      : %u",
-                (unsigned)disengageRT
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "ENGAGE H24        : %u",
-                (unsigned)engageH24
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "DISENGAGE H24     : %u",
-                (unsigned)disengageH24
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Active sensors    : %u",
-                (unsigned)active
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Alarm RT          : %u",
-                (unsigned)alarmRT
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Alarm H24         : %u",
-                (unsigned)alarmH24
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Memory RT         : %u",
-                (unsigned)memRT
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Memory H24        : %u",
-                (unsigned)memH24
-            );
-
-
-            // ============================================================
-            // FOOTER
-            // ============================================================
-
+            LOG_IF("SecurityOrchestrator","-----------------------------------------------");
+            LOG_IF("SecurityOrchestrator","Total sensors     : %u",(unsigned)ws.Count());
+            LOG_IF("SecurityOrchestrator","Enabled sensors   : %u",(unsigned)enabled);
+            LOG_IF("SecurityOrchestrator","Disabled sensors  : %u",(unsigned)disabled);
+            LOG_IF("SecurityOrchestrator","ENGAGE RT         : %u",(unsigned)engageRT);
+            LOG_IF("SecurityOrchestrator","DISENGAGE RT      : %u",(unsigned)disengageRT);
+            LOG_IF("SecurityOrchestrator","ENGAGE H24        : %u",(unsigned)engageH24);
+            LOG_IF("SecurityOrchestrator","DISENGAGE H24     : %u",(unsigned)disengageH24);
+            LOG_IF("SecurityOrchestrator","Active sensors    : %u",(unsigned)active);
+            LOG_IF("SecurityOrchestrator","Alarm RT          : %u",(unsigned)alarmRT);
+            LOG_IF("SecurityOrchestrator","Alarm H24         : %u",(unsigned)alarmH24);
+            LOG_IF("SecurityOrchestrator","Memory RT         : %u",(unsigned)memRT);
+            LOG_IF("SecurityOrchestrator","Memory H24        : %u",(unsigned)memH24);
             Footer();
         }
 
-
-        // ========================================================
-        // ZONES
-        // ========================================================
-
         static void ReportZones()
         {
-            Header(
-                "            SECURITY ORCHESTRATOR ZONES REPORT"
-            );
-
+            Header("            SECURITY ORCHESTRATOR ZONES REPORT");
 
             if (!initialized)
             {
-                LOG_IF(
-                    "SecurityOrchestrator",
-                    "Status : NOT INITIALIZED"
-                );
-
+                LOG_IF("SecurityOrchestrator","Status : NOT INITIALIZED");
                 Footer();
                 return;
             }
 
+            auto& zones = ws.Zones();
+            const auto& zoneMap = ws.GetZoneMap();
+            size_t alarmCount = 0;
 
-            auto& zones =
-                ws.Zones();
-
-
-            const auto& zoneMap =
-                ws.GetZoneMap();
-
-
-            size_t alarmCount =
-                0;
-
-
-            for (const auto& entry :
-                 zoneMap)
+            for (const auto& entry : zoneMap)
             {
-                const std::string& zoneName =
-                    entry.first;
+                const std::string& zoneName = entry.first;
+                const bool alarm = zones.ZoneAlarm(zoneName);
 
+                if (alarm) ++alarmCount;
 
-                const bool alarm =
-                    zones.ZoneAlarm(zoneName);
-
-
-                if (alarm)
-                    ++alarmCount;
-
-
-                LOG_IF(
-                    "SecurityOrchestrator",
+                LOG_IF("SecurityOrchestrator",
                     "%s -> %s",
                     zoneName.c_str(),
-                    alarm ? "ALARM" : "OK"
-                );
+                    alarm ? "ALARM" : "OK");
             }
 
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Zone count  : %u",
-                (unsigned)zoneMap.size()
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Alarm zones : %u",
-                (unsigned)alarmCount
-            );
-
-
+            LOG_IF("SecurityOrchestrator","Zone count  : %u",(unsigned)zoneMap.size());
+            LOG_IF("SecurityOrchestrator","Alarm zones : %u",(unsigned)alarmCount);
             Footer();
         }
-
-
-        // ========================================================
-        // COMMANDS
-        // ========================================================
 
         static void ReportCommands()
         {
@@ -4275,7 +3799,7 @@ public:
                 "==============================================="
             );
 
-            if (!SecurityOrchestrator::isInitialized())
+            if(!SecurityOrchestrator::isInitialized())
             {
                 LOG_IF(
                     "SecurityOrchestrator",
@@ -4290,7 +3814,7 @@ public:
                 return;
             }
 
-            if (!DomoManager::instance)
+            if(!DomoManager::instance)
             {
                 LOG_IF(
                     "SecurityOrchestrator",
@@ -4311,13 +3835,13 @@ public:
             auto& buffer =
                 manager.getBuffer();
 
-            auto& ws =
+            auto& sensors =
                 SecurityOrchestrator::getWiredSensors();
 
             const auto* sensorCfg =
-                ws.GetConfig();
+                sensors.GetConfig();
 
-            if (!sensorCfg)
+            if(!sensorCfg)
             {
                 LOG_IF(
                     "SecurityOrchestrator",
@@ -4332,27 +3856,23 @@ public:
                 return;
             }
 
-            // ============================================================
-            // SENSOR COMMANDS
-            // ============================================================
-
             size_t commandAreaCount = 0;
 
-            for (size_t i = 0;
-                i < ws.Count();
+            for(size_t i = 0;
+                i < sensors.Count();
                 ++i)
             {
                 const auto& cfg =
                     sensorCfg[i];
 
-                if (cfg.cmdArea < 0)
+                if(cfg.cmdArea < 0)
                 {
                     LOG_IF(
                         "SecurityOrchestrator",
                         "Sensor %u | name=%s | zone=%s | cmdArea=DISABLED",
                         (unsigned)i,
-                        cfg.name ? cfg.name : "<null>",
-                        cfg.zone ? cfg.zone : "<null>"
+                        cfg.name ? cfg.name : "?",
+                        cfg.zone ? cfg.zone : "?"
                     );
 
                     continue;
@@ -4361,53 +3881,41 @@ public:
                 ++commandAreaCount;
 
                 const long value =
-                    buffer.getValueFast(cfg.cmdArea);
-
-                /*
-                * Sensor command format:
-                *
-                * bit 0 = ENABLE
-                * bit 1 = ENGAGE
-                *
-                * Other bits are currently reserved.
-                */
+                    buffer.getValueFast(
+                        cfg.cmdArea
+                    );
 
                 const bool enable =
                     (value & (1L << 0)) != 0;
 
-                const bool engage =
+                const bool engageRT =
                     (value & (1L << 1)) != 0;
 
-                LOG_IF(
-                    "SecurityOrchestrator",
-                    "Sensor %u | name=%s | zone=%s",
-                    (unsigned)i,
-                    cfg.name ? cfg.name : "<null>",
-                    cfg.zone ? cfg.zone : "<null>"
-                );
+                const bool engageH24 =
+                    (value & (1L << 2)) != 0;
 
                 LOG_IF(
                     "SecurityOrchestrator",
-                    "  cmdArea=%d | value=0x%08lX",
+                    "Sensor %u | name=%s | zone=%s | cmdArea=%d | value=0x%08lX",
+                    (unsigned)i,
+                    cfg.name ? cfg.name : "?",
+                    cfg.zone ? cfg.zone : "?",
                     cfg.cmdArea,
                     (unsigned long)value
                 );
 
                 LOG_IF(
                     "SecurityOrchestrator",
-                    "  ENABLE=%u | ENGAGE=%u",
-                    enable,
-                    engage
+                    "  ENABLE=%u | ENGAGE_RT=%u | ENGAGE_H24=%u",
+                    enable ? 1 : 0,
+                    engageRT ? 1 : 0,
+                    engageH24 ? 1 : 0
                 );
 
-                // --------------------------------------------------------
-                // Eventuali bit non utilizzati
-                // --------------------------------------------------------
-
                 const long reservedBits =
-                    value & ~0x03L;
+                    value & ~0x07L;
 
-                if (reservedBits != 0)
+                if(reservedBits != 0)
                 {
                     LOG_IF(
                         "SecurityOrchestrator",
@@ -4416,10 +3924,6 @@ public:
                     );
                 }
             }
-
-            // ============================================================
-            // PANEL COMMAND
-            // ============================================================
 
             LOG_IF(
                 "SecurityOrchestrator",
@@ -4434,7 +3938,7 @@ public:
             const int panelCommandArea =
                 SecurityOrchestrator::cfgCopy.panelCommandArea;
 
-            if (panelCommandArea < 0)
+            if(panelCommandArea < 0)
             {
                 LOG_IF(
                     "SecurityOrchestrator",
@@ -4444,7 +3948,9 @@ public:
             else
             {
                 const long value =
-                    buffer.getValueFast(panelCommandArea);
+                    buffer.getValueFast(
+                        panelCommandArea
+                    );
 
                 const uint8_t command =
                     static_cast<uint8_t>(value);
@@ -4457,9 +3963,10 @@ public:
                     (unsigned)command
                 );
 
-                switch (
-                    static_cast<SecurityOrchestrator::AlarmPanelCommand>(
-                        command))
+                switch(
+                    static_cast<
+                        SecurityOrchestrator::AlarmPanelCommand
+                    >(command))
                 {
                     case SecurityOrchestrator::ARM_AWAY:
                         LOG_IF(
@@ -4497,12 +4004,7 @@ public:
                         );
                         break;
                 }
-
             }
-
-            // ============================================================
-            // SUMMARY
-            // ============================================================
 
             LOG_IF(
                 "SecurityOrchestrator",
@@ -4527,1535 +4029,591 @@ public:
             );
         }
 
-
-        // ========================================================
-        // SYSTEM
-        // ========================================================
-
         static void ReportSystem()
         {
-            Header(
-                "           SECURITY ORCHESTRATOR SYSTEM REPORT"
-            );
-
+            Header("           SECURITY ORCHESTRATOR SYSTEM REPORT");
 
             if (!initialized)
             {
-                LOG_IF(
-                    "SecurityOrchestrator",
-                    "Status : NOT INITIALIZED"
-                );
-
+                LOG_IF("SecurityOrchestrator","Status : NOT INITIALIZED");
                 Footer();
                 return;
             }
 
-
             system.Report();
-
-
             Footer();
         }
 
-
-        // ========================================================
-        // SECURITY
-        //
-        // Stato aggregato di sensors + zones + system.
-        // ========================================================
-
         static void ReportSecurity()
         {
-            Header(
-                "         SECURITY ORCHESTRATOR SECURITY REPORT"
-            );
-
+            Header("         SECURITY ORCHESTRATOR SECURITY REPORT");
 
             if (!initialized)
             {
-                LOG_IF(
-                    "SecurityOrchestrator",
-                    "Status : NOT INITIALIZED"
-                );
-
+                LOG_IF("SecurityOrchestrator","Status : NOT INITIALIZED");
                 Footer();
                 return;
             }
 
-
-            const auto* cfg =
-                ws.GetConfig();
-
-
-            size_t sensorCount =
-                ws.Count();
-
-
-            size_t activeSensors =
-                0;
-
-
-            size_t commandAreas =
-                0;
-
+            const auto* cfg = ws.GetConfig();
+            const size_t sensorCount = ws.Count();
+            size_t activeSensors = 0;
+            size_t commandAreas = 0;
 
             if (cfg)
             {
-                for (size_t i = 0;
-                     i < sensorCount;
-                     ++i)
+                for (size_t i = 0; i < sensorCount; ++i)
                 {
-                    Sensor* s =
-                        ws.GetSensor(i);
+                    Sensor* s = ws.GetSensor(i);
 
-
-                    if (s &&
-                        (s->Outputs().rt ||
-                        s->Outputs().h24))
-                    {
+                    if (s && (s->Outputs().rt || s->Outputs().h24))
                         ++activeSensors;
-                    }
-
 
                     if (cfg[i].cmdArea >= 0)
                         ++commandAreas;
                 }
             }
 
+            auto& zones = ws.Zones();
+            size_t activeZones = 0;
 
-            auto& zones =
-                ws.Zones();
-
-
-            size_t activeZones =
-                0;
-
-
-            for (const auto& entry :
-                 ws.GetZoneMap())
-            {
+            for (const auto& entry : ws.GetZoneMap())
                 if (zones.ZoneAlarm(entry.first))
                     ++activeZones;
-            }
 
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Initialized       : YES"
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Sensors           : %u",
-                (unsigned)sensorCount
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Active sensors    : %u",
-                (unsigned)activeSensors
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Zones             : %u",
-                (unsigned)ws.GetZoneMap().size()
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Active zones      : %u",
-                (unsigned)activeZones
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Command areas     : %u",
-                (unsigned)commandAreas
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Intrusion         : %s",
-                system.info.f[
-                    SystemManager::ALARM_INTRUSION
-                ].get()
-                    ? "ACTIVE"
-                    : "OK"
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Intrusion H24     : %s",
-                system.info.f[
-                    SystemManager::ALARM_INTRUSION_H24
-                ].get()
-                    ? "ACTIVE"
-                    : "OK"
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Flood             : %s",
-                system.info.f[
-                    SystemManager::ALARM_FLOOD
-                ].get()
-                    ? "ACTIVE"
-                    : "OK"
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Smoke             : %s",
-                system.info.f[
-                    SystemManager::ALARM_SMOKE
-                ].get()
-                    ? "ACTIVE"
-                    : "OK"
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Windows open      : %s",
-                system.info.f[
-                    SystemManager::WINDOWS_OPEN
-                ].get()
-                    ? "YES"
-                    : "NO"
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Doors open        : %s",
-                system.info.f[
-                    SystemManager::DOORS_OPEN
-                ].get()
-                    ? "YES"
-                    : "NO"
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Tamper            : %s",
-                system.info.f[
-                    SystemManager::ALARM_TAMPER
-                ].get()
-                    ? "ACTIVE"
-                    : "OK"
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "System bitmask    : 0x%08X",
-                (unsigned)system.getBitmask()
-            );
-
+            LOG_IF("SecurityOrchestrator","Initialized       : YES");
+            LOG_IF("SecurityOrchestrator","Sensors           : %u",(unsigned)sensorCount);
+            LOG_IF("SecurityOrchestrator","Active sensors    : %u",(unsigned)activeSensors);
+            LOG_IF("SecurityOrchestrator","Zones             : %u",(unsigned)ws.GetZoneMap().size());
+            LOG_IF("SecurityOrchestrator","Active zones      : %u",(unsigned)activeZones);
+            LOG_IF("SecurityOrchestrator","Command areas     : %u",(unsigned)commandAreas);
+            LOG_IF("SecurityOrchestrator","Intrusion         : %s",
+                system.info.f[SystemManager::ALARM_INTRUSION].get()?"ACTIVE":"OK");
+            LOG_IF("SecurityOrchestrator","Intrusion H24     : %s",
+                system.info.f[SystemManager::ALARM_INTRUSION_H24].get()?"ACTIVE":"OK");
+            LOG_IF("SecurityOrchestrator","Flood             : %s",
+                system.info.f[SystemManager::ALARM_FLOOD].get()?"ACTIVE":"OK");
+            LOG_IF("SecurityOrchestrator","Smoke             : %s",
+                system.info.f[SystemManager::ALARM_SMOKE].get()?"ACTIVE":"OK");
+            LOG_IF("SecurityOrchestrator","Windows open      : %s",
+                system.info.f[SystemManager::WINDOWS_OPEN].get()?"YES":"NO");
+            LOG_IF("SecurityOrchestrator","Doors open        : %s",
+                system.info.f[SystemManager::DOORS_OPEN].get()?"YES":"NO");
+            LOG_IF("SecurityOrchestrator","Tamper            : %s",
+                system.info.f[SystemManager::ALARM_TAMPER].get()?"ACTIVE":"OK");
+            LOG_IF("SecurityOrchestrator","Panic            : %s",
+                system.info.f[SystemManager::ALARM_PANIC].get()?"ACTIVE":"OK");
+            LOG_IF("SecurityOrchestrator","System bitmask    : 0x%08X",(unsigned)system.getBitmask());
 
             Footer();
         }
 
-
-        // ========================================================
-        // INCONSISTENCIES
-        // ========================================================
-
         static void ReportInconsistencies()
         {
-            Header(
-                "      SECURITY ORCHESTRATOR INCONSISTENCIES REPORT"
-            );
+            Header("      SECURITY ORCHESTRATOR INCONSISTENCIES REPORT");
 
-
-            bool found =
-                false;
-
-
-            // ----------------------------------------------------
-            // NOT INITIALIZED
-            // ----------------------------------------------------
+            bool found = false;
 
             if (!initialized)
             {
-                LOG_IF(
-                    "SecurityOrchestrator",
-                    "WARNING: SecurityOrchestrator not initialized"
-                );
-
+                LOG_IF("SecurityOrchestrator","WARNING: SecurityOrchestrator not initialized");
                 found = true;
             }
 
+            const auto* cfg = ws.GetConfig();
 
-            const auto* cfg =
-                ws.GetConfig();
-
-
-            // ----------------------------------------------------
-            // CONFIG POINTER
-            // ----------------------------------------------------
-
-            if (initialized &&
-                !cfg)
+            if (initialized && !cfg)
             {
-                LOG_IF(
-                    "SecurityOrchestrator",
-                    "ERROR: configuration pointer is NULL"
-                );
-
+                LOG_IF("SecurityOrchestrator","ERROR: configuration pointer is NULL");
                 found = true;
             }
 
-
-            if (initialized &&
-                cfg)
+            if (initialized && cfg)
             {
-                // ------------------------------------------------
-                // SENSOR POINTERS
-                // ------------------------------------------------
-
-                for (size_t i = 0;
-                     i < ws.Count();
-                     ++i)
+                for (size_t i = 0; i < ws.Count(); ++i)
                 {
-                    Sensor* s =
-                        ws.GetSensor(i);
-
+                    Sensor* s = ws.GetSensor(i);
 
                     if (!s)
                     {
-                        LOG_IF(
-                            "SecurityOrchestrator",
+                        LOG_IF("SecurityOrchestrator",
                             "ERROR: sensor %u has NULL runtime object",
-                            (unsigned)i
-                        );
-
+                            (unsigned)i);
                         found = true;
                     }
                 }
 
-
-                // ------------------------------------------------
-                // SENSOR CONFIGURATION
-                // ------------------------------------------------
-
-                for (size_t i = 0;
-                     i < ws.Count();
-                     ++i)
+                for (size_t i = 0; i < ws.Count(); ++i)
                 {
-                    const auto& c =
-                        cfg[i];
+                    const auto& c = cfg[i];
 
-
-                    if (!c.zone ||
-                        strlen(c.zone) == 0)
+                    if (!c.zone || strlen(c.zone) == 0)
                     {
-                        LOG_IF(
-                            "SecurityOrchestrator",
+                        LOG_IF("SecurityOrchestrator",
                             "ERROR: sensor %u has empty zone",
-                            (unsigned)i
-                        );
-
+                            (unsigned)i);
                         found = true;
                     }
-
 
                     if (c.channels.size() == 0)
                     {
-                        LOG_IF(
-                            "SecurityOrchestrator",
+                        LOG_IF("SecurityOrchestrator",
                             "ERROR: sensor %u zone=%s has no channels",
-                            (unsigned)i,
-                            c.zone ? c.zone : "?"
-                        );
-
+                            (unsigned)i,c.zone ? c.zone : "?");
                         found = true;
                     }
-
 
                     if (c.readers.size() == 0)
                     {
-                        LOG_IF(
-                            "SecurityOrchestrator",
+                        LOG_IF("SecurityOrchestrator",
                             "ERROR: sensor %u zone=%s has no readers",
-                            (unsigned)i,
-                            c.zone ? c.zone : "?"
-                        );
-
+                            (unsigned)i,c.zone ? c.zone : "?");
                         found = true;
                     }
 
-
-                    if (c.channels.size() !=
-                        c.readers.size())
+                    if (c.channels.size() != c.readers.size())
                     {
-                        LOG_IF(
-                            "SecurityOrchestrator",
-                            "ERROR: sensor %u zone=%s "
-                            "channels=%u readers=%u",
+                        LOG_IF("SecurityOrchestrator",
+                            "ERROR: sensor %u zone=%s channels=%u readers=%u",
                             (unsigned)i,
                             c.zone ? c.zone : "?",
                             (unsigned)c.channels.size(),
-                            (unsigned)c.readers.size()
-                        );
-
+                            (unsigned)c.readers.size());
                         found = true;
                     }
 
-
-                    for (const auto& ch :
-                         c.channels)
+                    for (const auto& ch : c.channels)
                     {
                         if (ch.pin < -1)
                         {
-                            LOG_IF(
-                                "SecurityOrchestrator",
-                                "ERROR: sensor %u zone=%s "
-                                "invalid pin=%d",
+                            LOG_IF("SecurityOrchestrator",
+                                "ERROR: sensor %u zone=%s invalid pin=%d",
                                 (unsigned)i,
                                 c.zone ? c.zone : "?",
-                                ch.pin
-                            );
-
+                                ch.pin);
                             found = true;
                         }
                     }
                 }
 
-                // ----------------------------------------------------
-                // DUPLICATE STATUS AREAS
-                // ----------------------------------------------------
-
-                for (size_t i = 0;
-                    i < ws.Count();
-                    ++i)
+                for (size_t i = 0; i < ws.Count(); ++i)
                 {
-                    const int areaI =
-                        cfg[i].statusArea;
+                    const int areaI = cfg[i].statusArea;
+                    if (areaI < 0) continue;
 
-                    if (areaI < 0)
-                        continue;
-
-                    for (size_t j = i + 1;
-                        j < ws.Count();
-                        ++j)
+                    for (size_t j = i + 1; j < ws.Count(); ++j)
                     {
-                        const int areaJ =
-                            cfg[j].statusArea;
-
-                        if (areaJ < 0)
-                            continue;
+                        const int areaJ = cfg[j].statusArea;
+                        if (areaJ < 0) continue;
 
                         if (areaI == areaJ)
                         {
-                            LOG_IF(
-                                "SecurityOrchestrator",
-                                "WARNING: duplicate status area %d "
-                                "used by sensors %u and %u",
-                                areaI,
-                                (unsigned)i,
-                                (unsigned)j
-                            );
-
+                            LOG_IF("SecurityOrchestrator",
+                                "WARNING: duplicate status area %d used by sensors %u and %u",
+                                areaI,(unsigned)i,(unsigned)j);
                             found = true;
                         }
                     }
                 }
 
-                // ------------------------------------------------
-                // DUPLICATE COMMAND AREAS
-                // ------------------------------------------------
-
-                for (size_t i = 0;
-                     i < ws.Count();
-                     ++i)
+                for (size_t i = 0; i < ws.Count(); ++i)
                 {
-                    const int areaI =
-                        cfg[i].cmdArea;
+                    const int areaI = cfg[i].cmdArea;
+                    if (areaI < 0) continue;
 
-
-                    if (areaI < 0)
-                        continue;
-
-
-                    for (size_t j = i + 1;
-                         j < ws.Count();
-                         ++j)
+                    for (size_t j = i + 1; j < ws.Count(); ++j)
                     {
-                        const int areaJ =
-                            cfg[j].cmdArea;
-
-
-                        if (areaJ < 0)
-                            continue;
-
+                        const int areaJ = cfg[j].cmdArea;
+                        if (areaJ < 0) continue;
 
                         if (areaI == areaJ)
                         {
-                            LOG_IF(
-                                "SecurityOrchestrator",
-                                "WARNING: duplicate command area %d "
-                                "used by sensors %u and %u",
-                                areaI,
-                                (unsigned)i,
-                                (unsigned)j
-                            );
-
+                            LOG_IF("SecurityOrchestrator",
+                                "WARNING: duplicate command area %d used by sensors %u and %u",
+                                areaI,(unsigned)i,(unsigned)j);
                             found = true;
                         }
                     }
                 }
             }
-
-
-            // ----------------------------------------------------
-            // SYSTEM STATE
-            // ----------------------------------------------------
 
             if (initialized)
             {
-                const int bitmask =
-                    system.getBitmask();
-
+                const int bitmask = system.getBitmask();
 
                 if (bitmask != 0)
                 {
-                    LOG_IF(
-                        "SecurityOrchestrator",
-                        "INFO: active system state bitmask "
-                        "0x%08X",
-                        (unsigned)bitmask
-                    );
+                    LOG_IF("SecurityOrchestrator",
+                        "INFO: active system state bitmask 0x%08X",
+                        (unsigned)bitmask);
                 }
             }
 
-
             if (!found)
-            {
-                LOG_IF(
-                    "SecurityOrchestrator",
-                    "No structural inconsistencies detected"
-                );
-            }
-
+                LOG_IF("SecurityOrchestrator","No structural inconsistencies detected");
 
             Footer();
         }
 
         static void ReportAlarmBitmaskMap()
         {
-            if (!initialized)
-                return;
-
+            if (!initialized) return;
             alarmMask.ReportMap(ws);
         }
 
-        // ========================================================
-        // HMI
-        // ========================================================
-
-        static void ReportHmi(); //Solo dichiarazione
-
-        // ========================================================
-        // CORE
-        //
-        // Report compatto.
-        // ========================================================
+        static void ReportHmi();
 
         static void CoreReport()
         {
-            Header(
-                "          SECURITY ORCHESTRATOR CORE REPORT"
-            );
-
+            Header("          SECURITY ORCHESTRATOR CORE REPORT");
 
             if (!initialized)
             {
-                LOG_IF(
-                    "SecurityOrchestrator",
-                    "Status            : NOT INITIALIZED"
-                );
-
+                LOG_IF("SecurityOrchestrator","Status            : NOT INITIALIZED");
                 Footer();
                 return;
             }
 
+            LOG_IF("SecurityOrchestrator","Initialized       : YES");
+            LOG_IF("SecurityOrchestrator","Sensors           : %u",(unsigned)ws.Count());
+            LOG_IF("SecurityOrchestrator","Zones             : %u",(unsigned)ws.GetZoneMap().size());
+            LOG_IF("SecurityOrchestrator","System bitmask    : 0x%08X",(unsigned)system.getBitmask());
+            LOG_IF("SecurityOrchestrator","Tamper            : %s",
+                system.info.f[SystemManager::ALARM_TAMPER].get()?"ACTIVE":"OK");
+            LOG_IF("SecurityOrchestrator","Panic            : %s",
+                system.info.f[SystemManager::ALARM_PANIC].get()?"ACTIVE":"OK");
+            LOG_IF("SecurityOrchestrator","Intrusion         : %s",
+                system.info.f[SystemManager::ALARM_INTRUSION].get()?"ACTIVE":"OK");
+            LOG_IF("SecurityOrchestrator","Intrusion H24     : %s",
+                system.info.f[SystemManager::ALARM_INTRUSION_H24].get()?"ACTIVE":"OK");
+            LOG_IF("SecurityOrchestrator","Flood             : %s",
+                system.info.f[SystemManager::ALARM_FLOOD].get()?"ACTIVE":"OK");
+            LOG_IF("SecurityOrchestrator","Smoke             : %s",
+                system.info.f[SystemManager::ALARM_SMOKE].get()?"ACTIVE":"OK");
+            LOG_IF("SecurityOrchestrator","Windows open      : %s",
+                system.info.f[SystemManager::WINDOWS_OPEN].get()?"YES":"NO");
+            LOG_IF("SecurityOrchestrator","Doors open        : %s",
+                system.info.f[SystemManager::DOORS_OPEN].get()?"YES":"NO");
+            LOG_IF("SecurityOrchestrator","Last loop at      : %lu",lastLoopAt);
+            LOG_IF("SecurityOrchestrator","Last changes      : 0x%02X",(unsigned)lastChanges);
+            LOG_IF("SecurityOrchestrator","  SENSOR          : %s",(lastChanges & CHANGE_SENSOR)?"YES":"NO");
+            LOG_IF("SecurityOrchestrator","  ZONE            : %s",(lastChanges & CHANGE_ZONE)?"YES":"NO");
+            LOG_IF("SecurityOrchestrator","  SYSTEM          : %s",(lastChanges & CHANGE_SYSTEM)?"YES":"NO");
+            LOG_IF("SecurityOrchestrator","  PANEL           : %s",(lastChanges & CHANGE_PANEL)?"YES":"NO");
+            LOG_IF("SecurityOrchestrator","  COMM            : %s",(lastChanges & CHANGE_COMM)?"YES":"NO");
+            LOG_IF("SecurityOrchestrator","  COMMAND         : %s",(lastChanges & CHANGE_COMMAND)?"YES":"NO");
 
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Initialized       : YES"
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Sensors           : %u",
-                (unsigned)ws.Count()
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Zones             : %u",
-                (unsigned)ws.GetZoneMap().size()
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "System bitmask    : 0x%08X",
-                (unsigned)system.getBitmask()
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Tamper            : %s",
-                system.info.f[
-                    SystemManager::ALARM_TAMPER
-                ].get()
-                    ? "ACTIVE"
-                    : "OK"
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Intrusion         : %s",
-                system.info.f[
-                    SystemManager::ALARM_INTRUSION
-                ].get()
-                    ? "ACTIVE"
-                    : "OK"
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Intrusion H24     : %s",
-                system.info.f[
-                    SystemManager::ALARM_INTRUSION_H24
-                ].get()
-                    ? "ACTIVE"
-                    : "OK"
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Flood             : %s",
-                system.info.f[
-                    SystemManager::ALARM_FLOOD
-                ].get()
-                    ? "ACTIVE"
-                    : "OK"
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Smoke             : %s",
-                system.info.f[
-                    SystemManager::ALARM_SMOKE
-                ].get()
-                    ? "ACTIVE"
-                    : "OK"
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Windows open      : %s",
-                system.info.f[
-                    SystemManager::WINDOWS_OPEN
-                ].get()
-                    ? "YES"
-                    : "NO"
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Doors open        : %s",
-                system.info.f[
-                    SystemManager::DOORS_OPEN
-                ].get()
-                    ? "YES"
-                    : "NO"
-            );
-
-
-            // ----------------------------------------------------
-            // LAST LOOP
-            // ----------------------------------------------------
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Last loop at      : %lu",
-                lastLoopAt
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Last changes      : 0x%02X",
-                (unsigned)lastChanges
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "  SENSOR          : %s",
-                (lastChanges & CHANGE_SENSOR)
-                    ? "YES"
-                    : "NO"
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "  ZONE            : %s",
-                (lastChanges & CHANGE_ZONE)
-                    ? "YES"
-                    : "NO"
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "  SYSTEM          : %s",
-                (lastChanges & CHANGE_SYSTEM)
-                    ? "YES"
-                    : "NO"
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "  PANEL           : %s",
-                (lastChanges & CHANGE_PANEL)
-                    ? "YES"
-                    : "NO"
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "  COMM            : %s",
-                (lastChanges & CHANGE_COMM)
-                    ? "YES"
-                    : "NO"
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "  COMMAND         : %s",
-                (lastChanges & CHANGE_COMMAND)
-                    ? "YES"
-                    : "NO"
-            );
-
+            LOG_IF("SecurityOrchestrator","--- SENSORS ---");
+            ReportSensors();
 
             Footer();
         }
-
-
-        // ========================================================
-        // DIAGNOSTICS
-        //
-        // Dump completo del sottosistema SecurityOrchestrator.
-        // ========================================================
 
         static void ReportDiagnostics()
         {
-            Header(
-                "        SECURITY ORCHESTRATOR DIAGNOSTICS"
-            );
+            Header("        SECURITY ORCHESTRATOR DIAGNOSTICS");
 
+            LOG_IF("SecurityOrchestrator","Initialized       : %s",initialized?"YES":"NO");
+            LOG_IF("SecurityOrchestrator","Sensor count      : %u",(unsigned)ws.Count());
+            LOG_IF("SecurityOrchestrator","Zone count        : %u",(unsigned)ws.GetZoneMap().size());
+            LOG_IF("SecurityOrchestrator","System bitmask    : 0x%08X",(unsigned)system.getBitmask());
+            LOG_IF("SecurityOrchestrator","Last loop at      : %lu",lastLoopAt);
+            LOG_IF("SecurityOrchestrator","Last changes      : 0x%02X",(unsigned)lastChanges);
 
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Initialized       : %s",
-                initialized
-                    ? "YES"
-                    : "NO"
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Sensor count      : %u",
-                (unsigned)ws.Count()
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Zone count        : %u",
-                (unsigned)ws.GetZoneMap().size()
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "System bitmask    : 0x%08X",
-                (unsigned)system.getBitmask()
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Last loop at      : %lu",
-                lastLoopAt
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "Last changes      : 0x%02X",
-                (unsigned)lastChanges
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "--- CONFIGURATION ---"
-            );
-
+            LOG_IF("SecurityOrchestrator","--- CONFIGURATION ---");
             ReportConfig();
 
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "--- SENSORS ---"
-            );
-
+            LOG_IF("SecurityOrchestrator","--- SENSORS ---");
             ReportSensors();
 
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "--- ZONES ---"
-            );
-
+            LOG_IF("SecurityOrchestrator","--- ZONES ---");
             ReportZones();
 
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "--- COMMANDS ---"
-            );
-
+            LOG_IF("SecurityOrchestrator","--- COMMANDS ---");
             ReportCommands();
 
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "--- SYSTEM ---"
-            );
-
+            LOG_IF("SecurityOrchestrator","--- SYSTEM ---");
             ReportSystem();
 
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "--- SECURITY ---"
-            );
-
+            LOG_IF("SecurityOrchestrator","--- SECURITY ---");
             ReportSecurity();
 
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "--- INCONSISTENCIES ---"
-            );
-
+            LOG_IF("SecurityOrchestrator","--- INCONSISTENCIES ---");
             ReportInconsistencies();
-
 
             Footer();
         }
 
-
-        // ========================================================
-        // FULL REPORT
-        // ========================================================
-
         static void FullReport()
         {
-            Header(
-                "        SECURITY ORCHESTRATOR FULL REPORT"
-            );
-
+            Header("        SECURITY ORCHESTRATOR FULL REPORT");
 
             CoreReport();
-
             ReportConfig();
-
             ReportSensors();
-
             ReportZones();
-
             ReportCommands();
-
             ReportSystem();
-
             ReportSecurity();
-
             ReportInconsistencies();
-
             ReportAlarmBitmaskMap();
-
             ReportHmi();
 
             Footer();
 
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "             END SECURITY REPORT"
-            );
-
-
-            LOG_IF(
-                "SecurityOrchestrator",
-                "================================================"
-            );
+            LOG_IF("SecurityOrchestrator","             END SECURITY REPORT");
+            LOG_IF("SecurityOrchestrator","================================================");
         }
     };
-
 
     // ============================================================
     // UNIFIED REPORT DISPATCHER
     // ============================================================
-
-    static void Report(
-        ReportMode mode = ReportMode::FULL)
+    static void Report(ReportMode mode = ReportMode::FULL)
     {
         switch (mode)
         {
-            case ReportMode::CORE:
-                Diagnostic::CoreReport();
-                break;
-
-
-            case ReportMode::CONFIG:
-                Diagnostic::ReportConfig();
-                break;
-
-
-            case ReportMode::SENSORS:
-                Diagnostic::ReportSensors();
-                break;
-
-
-            case ReportMode::ZONES:
-                Diagnostic::ReportZones();
-                break;
-
-
-            case ReportMode::COMMANDS:
-                Diagnostic::ReportCommands();
-                break;
-
-
-            case ReportMode::SYSTEM:
-                Diagnostic::ReportSystem();
-                break;
-
-
-            case ReportMode::SECURITY:
-                Diagnostic::ReportSecurity();
-                break;
-
-            case ReportMode::HMI:
-                Diagnostic::ReportHmi();
-                break;
-
-            case ReportMode::INCONSISTENCIES:
-                Diagnostic::ReportInconsistencies();
-                break;
-
-
-            case ReportMode::DIAGNOSTICS:
-                Diagnostic::ReportDiagnostics();
-                break;
-
-
+            case ReportMode::CORE:           Diagnostic::CoreReport(); break;
+            case ReportMode::CONFIG:         Diagnostic::ReportConfig(); break;
+            case ReportMode::SENSORS:        Diagnostic::ReportSensors(); break;
+            case ReportMode::ZONES:          Diagnostic::ReportZones(); break;
+            case ReportMode::COMMANDS:       Diagnostic::ReportCommands(); break;
+            case ReportMode::SYSTEM:         Diagnostic::ReportSystem(); break;
+            case ReportMode::SECURITY:       Diagnostic::ReportSecurity(); break;
+            case ReportMode::HMI:            Diagnostic::ReportHmi(); break;
+            case ReportMode::INCONSISTENCIES:Diagnostic::ReportInconsistencies(); break;
+            case ReportMode::DIAGNOSTICS:    Diagnostic::ReportDiagnostics(); break;
             case ReportMode::FULL:
-            default:
-                Diagnostic::FullReport();
-                break;
+            default:                         Diagnostic::FullReport(); break;
         }
     }
 
-
-    // ============================================================
-    // CONVENIENCE REPORT API
-    // ============================================================
-
-    static void ReportAll()
-    {
-        Report(ReportMode::FULL);
-    }
-
-
-    static void ReportCoreOnly()
-    {
-        Report(ReportMode::CORE);
-    }
-
-
-    static void ReportConfigOnly()
-    {
-        Report(ReportMode::CONFIG);
-    }
-
-
-    static void ReportSensorsOnly()
-    {
-        Report(ReportMode::SENSORS);
-    }
-
-
-    static void ReportZonesOnly()
-    {
-        Report(ReportMode::ZONES);
-    }
-
-
-    static void ReportCommandsOnly()
-    {
-        Report(ReportMode::COMMANDS);
-    }
-
-
-    static void ReportSystemOnly()
-    {
-        Report(ReportMode::SYSTEM);
-    }
-
-
-    static void ReportSecurityOnly()
-    {
-        Report(ReportMode::SECURITY);
-    }
-
-
-    static void ReportInconsistenciesOnly()
-    {
-        Report(ReportMode::INCONSISTENCIES);
-    }
-
-
-    static void ReportDiagnosticsOnly()
-    {
-        Report(ReportMode::DIAGNOSTICS);
-    }
-
+    static void ReportAll() { Report(ReportMode::FULL); }
+    static void ReportCoreOnly() { Report(ReportMode::CORE); }
+    static void ReportConfigOnly() { Report(ReportMode::CONFIG); }
+    static void ReportSensorsOnly() { Report(ReportMode::SENSORS); }
+    static void ReportZonesOnly() { Report(ReportMode::ZONES); }
+    static void ReportCommandsOnly() { Report(ReportMode::COMMANDS); }
+    static void ReportSystemOnly() { Report(ReportMode::SYSTEM); }
+    static void ReportSecurityOnly() { Report(ReportMode::SECURITY); }
+    static void ReportInconsistenciesOnly() { Report(ReportMode::INCONSISTENCIES); }
+    static void ReportDiagnosticsOnly() { Report(ReportMode::DIAGNOSTICS); }
 
     // ============================================================
     // ACCESSORS
     // ============================================================
+    static SystemManager& getSystem() { return system; }
+    static WiredSensorsManager& getWiredSensors() { return ws; }
+    static IntrusionBoardFaultManager& getBoardFaults() { return boardFaults; }
+    static bool isInitialized() { return initialized; }
+    static uint8_t getLastChanges() { return lastChanges; }
+    static unsigned long getLastLoopAt() { return lastLoopAt; }
+    static int getPanelCommandArea() { return cfgCopy.panelCommandArea; }
+    static const FrontendConfig::Security& getConfig() { return cfgCopy; }
 
-    static SystemManager& getSystem()
+    static bool IsSensorAnomaly(size_t sensorIndex)
     {
-        return system;
+        const Sensor* sensor = ws.GetSensor(sensorIndex);
+
+        if (!sensor || !sensor->IsEnabled())
+            return false;
+
+        return boardFaults.IsSensorAnomaly(sensorIndex);
     }
 
-
-    static WiredSensorsManager& getWiredSensors()
+    static bool IsZoneAnomaly(size_t zoneIndex)
     {
-        return ws;
+        return boardFaults.IsZoneAnomaly(zoneIndex);
     }
 
-
-    static bool isInitialized()
+    static uint64_t getCurrentAlarmMask() { return alarmMask.GetCurrentMask(); }
+    static uint64_t getAlarmMemoryMask() { return alarmMask.GetMemoryMask(); }
+    static bool HasUnsilencedMemory()
     {
-        return initialized;
+        return alarmMask.HasUnsilencedMemory();
     }
 
+    // --------------------------------------------------------
+    // TACITAZIONE ALLARMI ATTUALI
+    // --------------------------------------------------------
 
-    static uint8_t getLastChanges()
+    static void SilenceCurrentAlarms()
     {
-        return lastChanges;
-    }
-
-
-    static unsigned long getLastLoopAt()
-    {
-        return lastLoopAt;
-    }
-
-    static int getPanelCommandArea()
-    {
-        return cfgCopy.panelCommandArea;
-    }
-
-    static const FrontendConfig::Security& getConfig()
-    {
-        return cfgCopy;
-    }
-
-    // ============================================================
-    // CURRENT ALARM MASK
-    //
-    // Maschera degli allarmi attualmente presenti.
-    //
-    // La source of truth è AlarmBitmaskManager.
-    // Non viene mantenuta una seconda activeAlarmMask.
-    // ============================================================
-
-    static uint64_t getCurrentAlarmMask()
-    {
-        return alarmMask.currentMask;
-    }
-
-    static uint64_t getAlarmMemoryMask()
-    {
-        return alarmMask.memMask;
+        alarmMask.SilenceCurrent();
     }
 
     // ============================================================
     // CALLBACKS
     // ============================================================
-
-    static void RegisterCallbackAny(
-        AlarmDispatcher::Callback cb)
+    static void RegisterCallbackAny(AlarmDispatcher::Callback cb)
     {
         ws.Zones().dispatcher.OnAnyAlarm(cb);
     }
-
 
     static void RegisterCallbackType(
         SensorChannelType type,
         AlarmDispatcher::Callback cb)
     {
-        ws.Zones().dispatcher.OnAlarmType(
-            type,
-            cb
-        );
+        ws.Zones().dispatcher.OnAlarmType(type,cb);
     }
-
 
     static void RegisterCallbackZone(
         const std::string& zone,
         AlarmDispatcher::Callback cb)
     {
-        ws.Zones().dispatcher.OnZoneAlarm(
-            zone,
-            cb
-        );
+        ws.Zones().dispatcher.OnZoneAlarm(zone,cb);
     }
-
 
     static void RegisterCallbackZoneType(
         const std::string& zone,
         SensorChannelType type,
         AlarmDispatcher::Callback cb)
     {
-        ws.Zones().dispatcher.OnZoneAlarmType(
-            zone,
-            type,
-            cb
-        );
+        ws.Zones().dispatcher.OnZoneAlarmType(zone,type,cb);
     }
 };
 
 inline void AlarmPanelInterface::ReportInconsistencies()
 {
-    LOG_IF(
-        "SecurityOrchestrator",
-        "==============================================="
-    );
-
-    LOG_IF(
-        "SecurityOrchestrator",
-        "      SECURITY ORCHESTRATOR INCONSISTENCIES REPORT"
-    );
-
-    LOG_IF(
-        "SecurityOrchestrator",
-        "==============================================="
-    );
+    constexpr const char* TAG = "SecurityOrchestrator";
+    LOG_IF(TAG, "===============================================");
+    LOG_IF(TAG, "      SECURITY ORCHESTRATOR INCONSISTENCIES REPORT");
+    LOG_IF(TAG, "===============================================");
 
     bool inconsistent = false;
-
     if (!SecurityOrchestrator::isInitialized())
     {
-        LOG_IF(
-            "SecurityOrchestrator",
-            "WARNING: SecurityOrchestrator is not initialized"
-        );
-
+        LOG_IF(TAG, "WARNING: SecurityOrchestrator is not initialized");
         inconsistent = true;
     }
 
-    const auto& ws =
-        SecurityOrchestrator::getWiredSensors();
-
-    const auto* sensorCfg =
-        ws.GetConfig();
-
-    const auto& securityCfg =
-        SecurityOrchestrator::getConfig();
+    const auto& ws = SecurityOrchestrator::getWiredSensors();
+    const auto* sensorCfg = ws.GetConfig();
+    const auto& securityCfg = SecurityOrchestrator::getConfig();
+    const size_t sensorCount = ws.Count();
 
     // ============================================================
     // CONFIGURAZIONE SENSORI
     // ============================================================
-
     if (!sensorCfg)
     {
-        LOG_IF(
-            "SecurityOrchestrator",
-            "ERROR: sensor configuration is null"
-        );
-
+        LOG_IF(TAG, "ERROR: sensor configuration is null");
         inconsistent = true;
     }
     else
     {
-        for (size_t i = 0; i < ws.Count(); ++i)
+        // --------------------------------------------------------
+        // Validazione sensori + collisioni con aree globali
+        // --------------------------------------------------------
+        auto checkGlobalAreas = [&](size_t i, const char* name, int area, const char* field)
         {
-            const auto& cfg =
-                sensorCfg[i];
+            if (area < 0) return;
 
-            // ----------------------------------------------------
-            // Nome sensore
-            // ----------------------------------------------------
+            if (securityCfg.statusArea >= 0 && area == securityCfg.statusArea)
+            {
+                LOG_IF(TAG, "WARNING: sensor[%u] '%s' %s=%d collides with security statusArea",
+                       (unsigned)i, name, field, area);
+                inconsistent = true;
+            }
+            if (securityCfg.eventArea >= 0 && area == securityCfg.eventArea)
+            {
+                LOG_IF(TAG, "WARNING: sensor[%u] '%s' %s=%d collides with security eventArea",
+                       (unsigned)i, name, field, area);
+                inconsistent = true;
+            }
+            if (securityCfg.panelCommandArea >= 0 && area == securityCfg.panelCommandArea)
+            {
+                LOG_IF(TAG, "WARNING: sensor[%u] '%s' %s=%d collides with panelCommandArea",
+                       (unsigned)i, name, field, area);
+                inconsistent = true;
+            }
+        };
+
+        for (size_t i = 0; i < sensorCount; ++i)
+        {
+            const auto& cfg = sensorCfg[i];
+            const char* name = cfg.name ? cfg.name : "<null>";
 
             if (!cfg.name || !cfg.name[0])
             {
-                LOG_IF(
-                    "SecurityOrchestrator",
-                    "WARNING: sensor[%u] has invalid name",
-                    (unsigned)i
-                );
-
+                LOG_IF(TAG, "WARNING: sensor[%u] has invalid name", (unsigned)i);
                 inconsistent = true;
             }
-
-            // ----------------------------------------------------
-            // Zona
-            // ----------------------------------------------------
 
             if (!cfg.zone || !cfg.zone[0])
             {
-                LOG_IF(
-                    "SecurityOrchestrator",
-                    "WARNING: sensor[%u] '%s' has no zone",
-                    (unsigned)i,
-                    cfg.name ? cfg.name : "<null>"
-                );
-
+                LOG_IF(TAG, "WARNING: sensor[%u] '%s' has no zone",
+                       (unsigned)i, name);
                 inconsistent = true;
             }
-            else
+            else if (ws.GetZoneIndex(cfg.zone) < 0)
             {
-                const int zoneIndex =
-                    ws.GetZoneIndex(cfg.zone);
-
-                if (zoneIndex < 0)
-                {
-                    LOG_IF(
-                        "SecurityOrchestrator",
-                        "WARNING: sensor[%u] '%s' references "
-                        "unknown zone '%s'",
-                        (unsigned)i,
-                        cfg.name ? cfg.name : "<null>",
-                        cfg.zone
-                    );
-
-                    inconsistent = true;
-                }
-            }
-
-            // ----------------------------------------------------
-            // Channels / readers
-            // ----------------------------------------------------
-
-            if (cfg.channels.size() != cfg.readers.size())
-            {
-                LOG_IF(
-                    "SecurityOrchestrator",
-                    "WARNING: sensor[%u] '%s' channels=%u "
-                    "readers=%u",
-                    (unsigned)i,
-                    cfg.name ? cfg.name : "<null>",
-                    (unsigned)cfg.channels.size(),
-                    (unsigned)cfg.readers.size()
-                );
-
+                LOG_IF(TAG, "WARNING: sensor[%u] '%s' references unknown zone '%s'",
+                       (unsigned)i, name, cfg.zone);
                 inconsistent = true;
             }
 
-            if (cfg.channels.size() == 0)
-            {
-                LOG_IF(
-                    "SecurityOrchestrator",
-                    "WARNING: sensor[%u] '%s' has no channels",
-                    (unsigned)i,
-                    cfg.name ? cfg.name : "<null>"
-                );
+            const size_t channels = cfg.channels.size();
+            const size_t readers = cfg.readers.size();
 
+            if (channels != readers)
+            {
+                LOG_IF(TAG, "WARNING: sensor[%u] '%s' channels=%u readers=%u",
+                       (unsigned)i, name, (unsigned)channels, (unsigned)readers);
                 inconsistent = true;
             }
 
-            // ----------------------------------------------------
-            // Sensor command area
-            // ----------------------------------------------------
+            if (channels == 0)
+            {
+                LOG_IF(TAG, "WARNING: sensor[%u] '%s' has no channels",
+                       (unsigned)i, name);
+                inconsistent = true;
+            }
 
             if (cfg.cmdArea < 0)
-            {
-                LOG_IF(
-                    "SecurityOrchestrator",
-                    "INFO: sensor[%u] '%s' has no cmdArea",
-                    (unsigned)i,
-                    cfg.name ? cfg.name : "<null>"
-                );
-            }
-
-            // ----------------------------------------------------
-            // Sensor status area
-            // ----------------------------------------------------
+                LOG_IF(TAG, "INFO: sensor[%u] '%s' has no cmdArea",
+                       (unsigned)i, name);
 
             if (cfg.statusArea < 0)
+                LOG_IF(TAG, "INFO: sensor[%u] '%s' has no statusArea",
+                       (unsigned)i, name);
+
+            checkGlobalAreas(i, name, cfg.cmdArea, "cmdArea");
+            checkGlobalAreas(i, name, cfg.statusArea, "statusArea");
+
+            if (cfg.cmdArea >= 0 && cfg.statusArea >= 0 && cfg.cmdArea == cfg.statusArea)
             {
-                LOG_IF(
-                    "SecurityOrchestrator",
-                    "INFO: sensor[%u] '%s' has no statusArea",
-                    (unsigned)i,
-                    cfg.name ? cfg.name : "<null>"
-                );
-            }
-        }
-
-        // ========================================================
-        // DUPLICATE SENSOR COMMAND AREAS
-        // ========================================================
-
-        for (size_t i = 0; i < ws.Count(); ++i)
-        {
-            const int areaI =
-                sensorCfg[i].cmdArea;
-
-            if (areaI < 0)
-                continue;
-
-            for (size_t j = i + 1; j < ws.Count(); ++j)
-            {
-                const int areaJ =
-                    sensorCfg[j].cmdArea;
-
-                if (areaJ < 0)
-                    continue;
-
-                if (areaI == areaJ)
-                {
-                    LOG_IF(
-                        "SecurityOrchestrator",
-                        "WARNING: duplicate sensor cmdArea=%d "
-                        "used by sensors %u and %u",
-                        areaI,
-                        (unsigned)i,
-                        (unsigned)j
-                    );
-
-                    inconsistent = true;
-                }
-            }
-        }
-
-        // ========================================================
-        // DUPLICATE SENSOR STATUS AREAS
-        // ========================================================
-
-        for (size_t i = 0; i < ws.Count(); ++i)
-        {
-            const int areaI =
-                sensorCfg[i].statusArea;
-
-            if (areaI < 0)
-                continue;
-
-            for (size_t j = i + 1; j < ws.Count(); ++j)
-            {
-                const int areaJ =
-                    sensorCfg[j].statusArea;
-
-                if (areaJ < 0)
-                    continue;
-
-                if (areaI == areaJ)
-                {
-                    LOG_IF(
-                        "SecurityOrchestrator",
-                        "WARNING: duplicate sensor statusArea=%d "
-                        "used by sensors %u and %u",
-                        areaI,
-                        (unsigned)i,
-                        (unsigned)j
-                    );
-
-                    inconsistent = true;
-                }
-            }
-        }
-
-        // ========================================================
-        // SENSOR COMMAND / STATUS COLLISIONS
-        // ========================================================
-
-        for (size_t i = 0; i < ws.Count(); ++i)
-        {
-            const int cmdArea =
-                sensorCfg[i].cmdArea;
-
-            if (cmdArea < 0)
-                continue;
-
-            const int statusArea =
-                sensorCfg[i].statusArea;
-
-            if (statusArea >= 0 &&
-                cmdArea == statusArea)
-            {
-                LOG_IF(
-                    "SecurityOrchestrator",
-                    "WARNING: sensor[%u] '%s' cmdArea=%d "
-                    "collides with its statusArea",
-                    (unsigned)i,
-                    sensorCfg[i].name
-                        ? sensorCfg[i].name
-                        : "<null>",
-                    cmdArea
-                );
-
+                LOG_IF(TAG, "WARNING: sensor[%u] '%s' cmdArea=%d collides with its statusArea",
+                       (unsigned)i, name, cfg.cmdArea);
                 inconsistent = true;
             }
         }
 
-        // ========================================================
-        // SENSOR AREA VS GLOBAL SECURITY AREAS
-        // ========================================================
-
-        for (size_t i = 0; i < ws.Count(); ++i)
+        // --------------------------------------------------------
+        // Duplicati / collisioni tra sensori
+        // Una sola scansione O(n²) invece di tre
+        // --------------------------------------------------------
+        for (size_t i = 0; i < sensorCount; ++i)
         {
-            const auto& cfg =
-                sensorCfg[i];
+            const auto& a = sensorCfg[i];
 
-            // ----------------------------------------------------
-            // cmdArea
-            // ----------------------------------------------------
+            if (a.cmdArea < 0 && a.statusArea < 0) continue;
 
-            if (cfg.cmdArea >= 0)
+            for (size_t j = i + 1; j < sensorCount; ++j)
             {
-                if (securityCfg.statusArea >= 0 &&
-                    cfg.cmdArea == securityCfg.statusArea)
-                {
-                    LOG_IF(
-                        "SecurityOrchestrator",
-                        "WARNING: sensor[%u] '%s' cmdArea=%d "
-                        "collides with security statusArea",
-                        (unsigned)i,
-                        cfg.name ? cfg.name : "<null>",
-                        cfg.cmdArea
-                    );
+                const auto& b = sensorCfg[j];
 
+                if (a.cmdArea >= 0 && a.cmdArea == b.cmdArea)
+                {
+                    LOG_IF(TAG, "WARNING: duplicate sensor cmdArea=%d used by sensors %u and %u",
+                           a.cmdArea, (unsigned)i, (unsigned)j);
                     inconsistent = true;
                 }
 
-                if (securityCfg.eventArea >= 0 &&
-                    cfg.cmdArea == securityCfg.eventArea)
+                if (a.statusArea >= 0 && a.statusArea == b.statusArea)
                 {
-                    LOG_IF(
-                        "SecurityOrchestrator",
-                        "WARNING: sensor[%u] '%s' cmdArea=%d "
-                        "collides with security eventArea",
-                        (unsigned)i,
-                        cfg.name ? cfg.name : "<null>",
-                        cfg.cmdArea
-                    );
-
-                    inconsistent = true;
-                }
-
-                if (securityCfg.panelCommandArea >= 0 &&
-                    cfg.cmdArea == securityCfg.panelCommandArea)
-                {
-                    LOG_IF(
-                        "SecurityOrchestrator",
-                        "WARNING: sensor[%u] '%s' cmdArea=%d "
-                        "collides with panelCommandArea",
-                        (unsigned)i,
-                        cfg.name ? cfg.name : "<null>",
-                        cfg.cmdArea
-                    );
-
-                    inconsistent = true;
-                }
-            }
-
-            // ----------------------------------------------------
-            // statusArea
-            // ----------------------------------------------------
-
-            if (cfg.statusArea >= 0)
-            {
-                if (securityCfg.statusArea >= 0 &&
-                    cfg.statusArea == securityCfg.statusArea)
-                {
-                    LOG_IF(
-                        "SecurityOrchestrator",
-                        "WARNING: sensor[%u] '%s' statusArea=%d "
-                        "collides with security statusArea",
-                        (unsigned)i,
-                        cfg.name ? cfg.name : "<null>",
-                        cfg.statusArea
-                    );
-
-                    inconsistent = true;
-                }
-
-                if (securityCfg.eventArea >= 0 &&
-                    cfg.statusArea == securityCfg.eventArea)
-                {
-                    LOG_IF(
-                        "SecurityOrchestrator",
-                        "WARNING: sensor[%u] '%s' statusArea=%d "
-                        "collides with security eventArea",
-                        (unsigned)i,
-                        cfg.name ? cfg.name : "<null>",
-                        cfg.statusArea
-                    );
-
-                    inconsistent = true;
-                }
-
-                if (securityCfg.panelCommandArea >= 0 &&
-                    cfg.statusArea == securityCfg.panelCommandArea)
-                {
-                    LOG_IF(
-                        "SecurityOrchestrator",
-                        "WARNING: sensor[%u] '%s' statusArea=%d "
-                        "collides with panelCommandArea",
-                        (unsigned)i,
-                        cfg.name ? cfg.name : "<null>",
-                        cfg.statusArea
-                    );
-
+                    LOG_IF(TAG, "WARNING: duplicate sensor statusArea=%d used by sensors %u and %u",
+                           a.statusArea, (unsigned)i, (unsigned)j);
                     inconsistent = true;
                 }
             }
@@ -6065,186 +4623,96 @@ inline void AlarmPanelInterface::ReportInconsistencies()
     // ============================================================
     // ZONE CONFIGURATION
     // ============================================================
+    const size_t zoneCount = securityCfg.zoneCount;
 
-    if (securityCfg.zoneCount > 0 &&
-        !securityCfg.zones)
+    if (zoneCount > 0 && !securityCfg.zones)
     {
-        LOG_IF(
-            "SecurityOrchestrator",
-            "WARNING: zoneCount=%u but zone configuration is null",
-            (unsigned)securityCfg.zoneCount
-        );
-
+        LOG_IF(TAG, "WARNING: zoneCount=%u but zone configuration is null",
+               (unsigned)zoneCount);
         inconsistent = true;
     }
     else
     {
-        for (size_t i = 0;
-            i < securityCfg.zoneCount;
-            ++i)
+        // --------------------------------------------------------
+        // Validazione zone + collisioni con aree globali
+        // --------------------------------------------------------
+        for (size_t i = 0; i < zoneCount; ++i)
         {
-            const auto& zoneCfg =
-                securityCfg.zones[i];
+            const auto& zoneCfg = securityCfg.zones[i];
 
-            if (!zoneCfg.name ||
-                !zoneCfg.name[0])
+            if (!zoneCfg.name || !zoneCfg.name[0])
             {
-                LOG_IF(
-                    "SecurityOrchestrator",
-                    "WARNING: configured zone[%u] has invalid name",
-                    (unsigned)i
-                );
-
+                LOG_IF(TAG, "WARNING: configured zone[%u] has invalid name",
+                       (unsigned)i);
                 inconsistent = true;
-
                 continue;
             }
-
-            // ----------------------------------------------------
-            // Zona configurata ma non presente nel manager
-            // ----------------------------------------------------
 
             if (ws.GetZoneIndex(zoneCfg.name) < 0)
             {
-                LOG_IF(
-                    "SecurityOrchestrator",
-                    "WARNING: configured zone '%s' "
-                    "does not exist in ZoneManager",
-                    zoneCfg.name
-                );
-
+                LOG_IF(TAG, "WARNING: configured zone '%s' does not exist in ZoneManager",
+                       zoneCfg.name);
                 inconsistent = true;
             }
-
-            // ----------------------------------------------------
-            // statusArea
-            // ----------------------------------------------------
 
             if (zoneCfg.statusArea < 0)
             {
-                LOG_IF(
-                    "SecurityOrchestrator",
-                    "WARNING: zone '%s' has invalid statusArea=%d",
-                    zoneCfg.name,
-                    zoneCfg.statusArea
-                );
-
+                LOG_IF(TAG, "WARNING: zone '%s' has invalid statusArea=%d",
+                       zoneCfg.name, zoneCfg.statusArea);
                 inconsistent = true;
-            }
-        }
-
-        // ========================================================
-        // DUPLICATE ZONE CONFIGURATION
-        // ========================================================
-
-        for (size_t i = 0;
-            i < securityCfg.zoneCount;
-            ++i)
-        {
-            const auto& zoneI =
-                securityCfg.zones[i];
-
-            if (!zoneI.name)
-                continue;
-
-            for (size_t j = i + 1;
-                j < securityCfg.zoneCount;
-                ++j)
-            {
-                const auto& zoneJ =
-                    securityCfg.zones[j];
-
-                if (!zoneJ.name)
-                    continue;
-
-                if (std::strcmp(
-                        zoneI.name,
-                        zoneJ.name) == 0)
-                {
-                    LOG_IF(
-                        "SecurityOrchestrator",
-                        "WARNING: duplicate zone configuration '%s'",
-                        zoneI.name
-                    );
-
-                    inconsistent = true;
-                }
-
-                if (zoneI.statusArea >= 0 &&
-                    zoneI.statusArea == zoneJ.statusArea)
-                {
-                    LOG_IF(
-                        "SecurityOrchestrator",
-                        "WARNING: duplicate zone statusArea=%d "
-                        "used by '%s' and '%s'",
-                        zoneI.statusArea,
-                        zoneI.name,
-                        zoneJ.name
-                    );
-
-                    inconsistent = true;
-                }
-            }
-        }
-
-        // ========================================================
-        // ZONE STATUS AREA VS GLOBAL AREAS
-        // ========================================================
-
-        for (size_t i = 0;
-            i < securityCfg.zoneCount;
-            ++i)
-        {
-            const auto& zoneCfg =
-                securityCfg.zones[i];
-
-            if (!zoneCfg.name ||
-                zoneCfg.statusArea < 0)
-            {
                 continue;
             }
 
-            if (securityCfg.statusArea >= 0 &&
-                zoneCfg.statusArea == securityCfg.statusArea)
+            if (securityCfg.statusArea >= 0 && zoneCfg.statusArea == securityCfg.statusArea)
             {
-                LOG_IF(
-                    "SecurityOrchestrator",
-                    "WARNING: zone '%s' statusArea=%d "
-                    "collides with security statusArea",
-                    zoneCfg.name,
-                    zoneCfg.statusArea
-                );
-
+                LOG_IF(TAG, "WARNING: zone '%s' statusArea=%d collides with security statusArea",
+                       zoneCfg.name, zoneCfg.statusArea);
                 inconsistent = true;
             }
 
-            if (securityCfg.eventArea >= 0 &&
-                zoneCfg.statusArea == securityCfg.eventArea)
+            if (securityCfg.eventArea >= 0 && zoneCfg.statusArea == securityCfg.eventArea)
             {
-                LOG_IF(
-                    "SecurityOrchestrator",
-                    "WARNING: zone '%s' statusArea=%d "
-                    "collides with security eventArea",
-                    zoneCfg.name,
-                    zoneCfg.statusArea
-                );
-
+                LOG_IF(TAG, "WARNING: zone '%s' statusArea=%d collides with security eventArea",
+                       zoneCfg.name, zoneCfg.statusArea);
                 inconsistent = true;
             }
 
             if (securityCfg.panelCommandArea >= 0 &&
-                zoneCfg.statusArea ==
-                    securityCfg.panelCommandArea)
+                zoneCfg.statusArea == securityCfg.panelCommandArea)
             {
-                LOG_IF(
-                    "SecurityOrchestrator",
-                    "WARNING: zone '%s' statusArea=%d "
-                    "collides with panelCommandArea",
-                    zoneCfg.name,
-                    zoneCfg.statusArea
-                );
-
+                LOG_IF(TAG, "WARNING: zone '%s' statusArea=%d collides with panelCommandArea",
+                       zoneCfg.name, zoneCfg.statusArea);
                 inconsistent = true;
+            }
+        }
+
+        // --------------------------------------------------------
+        // Duplicati zone: nome + statusArea
+        // --------------------------------------------------------
+        for (size_t i = 0; i < zoneCount; ++i)
+        {
+            const auto& a = securityCfg.zones[i];
+            if (!a.name) continue;
+
+            for (size_t j = i + 1; j < zoneCount; ++j)
+            {
+                const auto& b = securityCfg.zones[j];
+                if (!b.name) continue;
+
+                if (std::strcmp(a.name, b.name) == 0)
+                {
+                    LOG_IF(TAG, "WARNING: duplicate zone configuration '%s'", a.name);
+                    inconsistent = true;
+                }
+
+                if (a.statusArea >= 0 &&
+                    b.statusArea >= 0 &&
+                    a.statusArea == b.statusArea)
+                {
+                    LOG_IF(TAG, "WARNING: duplicate zone statusArea=%d used by '%s' and '%s'",
+                           a.statusArea, a.name, b.name);
+                    inconsistent = true;
+                }
             }
         }
     }
@@ -6252,107 +4720,57 @@ inline void AlarmPanelInterface::ReportInconsistencies()
     // ============================================================
     // GLOBAL SECURITY AREAS
     // ============================================================
-
     if (securityCfg.statusArea >= 0 &&
         securityCfg.eventArea >= 0 &&
         securityCfg.statusArea == securityCfg.eventArea)
     {
-        LOG_IF(
-            "SecurityOrchestrator",
-            "WARNING: statusArea=%d collides with eventArea",
-            securityCfg.statusArea
-        );
-
+        LOG_IF(TAG, "WARNING: statusArea=%d collides with eventArea",
+               securityCfg.statusArea);
         inconsistent = true;
     }
 
     if (securityCfg.statusArea >= 0 &&
         securityCfg.panelCommandArea >= 0 &&
-        securityCfg.statusArea ==
-            securityCfg.panelCommandArea)
+        securityCfg.statusArea == securityCfg.panelCommandArea)
     {
-        LOG_IF(
-            "SecurityOrchestrator",
-            "WARNING: statusArea=%d collides with "
-            "panelCommandArea",
-            securityCfg.statusArea
-        );
-
+        LOG_IF(TAG, "WARNING: statusArea=%d collides with panelCommandArea",
+               securityCfg.statusArea);
         inconsistent = true;
     }
 
     if (securityCfg.eventArea >= 0 &&
         securityCfg.panelCommandArea >= 0 &&
-        securityCfg.eventArea ==
-            securityCfg.panelCommandArea)
+        securityCfg.eventArea == securityCfg.panelCommandArea)
     {
-        LOG_IF(
-            "SecurityOrchestrator",
-            "WARNING: eventArea=%d collides with "
-            "panelCommandArea",
-            securityCfg.eventArea
-        );
-
+        LOG_IF(TAG, "WARNING: eventArea=%d collides with panelCommandArea",
+               securityCfg.eventArea);
         inconsistent = true;
     }
 
     // ============================================================
     // ZONE SHARING - VALID, NOT AN INCONSISTENCY
     // ============================================================
-
     /*
-    * Più sensori nella stessa zona sono perfettamente validi.
-    *
-    * Esempio:
-    *
-    *   Cucina:
-    *     - PIR Cucina
-    *     - Porta Cucina
-    *     - Allagamento Cucina
-    *     - Fumo Cucina
-    *
-    * Non viene quindi più emesso alcun WARNING per
-    * la condivisione della stessa zona.
-    */
+     * Più sensori nella stessa zona sono perfettamente validi.
+     */
 
     // ============================================================
     // SYSTEM STATE
     // ============================================================
+    const int systemMask = SecurityOrchestrator::getSystem().getBitmask();
 
-    const int systemMask =
-        SecurityOrchestrator::
-            getSystem()
-            .getBitmask();
-
-    LOG_IF(
-        "SecurityOrchestrator",
-        "INFO: active system state bitmask 0x%08X",
-        (unsigned)systemMask
-    );
+    LOG_IF(TAG, "INFO: active system state bitmask 0x%08X",
+           (unsigned)systemMask);
 
     // ============================================================
     // RESULT
     // ============================================================
+    LOG_IF(TAG,
+           inconsistent
+               ? "WARNING: one or more inconsistencies detected"
+               : "No inconsistencies detected");
 
-    if (!inconsistent)
-    {
-        LOG_IF(
-            "SecurityOrchestrator",
-            "No inconsistencies detected"
-        );
-    }
-    else
-    {
-        LOG_IF(
-            "SecurityOrchestrator",
-            "WARNING: one or more inconsistencies detected"
-        );
-    }
-
-    LOG_IF(
-        "SecurityOrchestrator",
-        "==============================================="
-    );
+    LOG_IF(TAG, "===============================================");
 }
 
 class DomoManagerAlarmPanel : public AlarmPanelInterface
@@ -6360,99 +4778,54 @@ class DomoManagerAlarmPanel : public AlarmPanelInterface
 private:
     // ============================================================
     // SILENCED ALARM MASK
-    //
-    // Bit degli allarmi attualmente attivi che sono già stati
-    // tacitati.
-    //
-    // La maschera degli allarmi correnti NON è duplicata qui:
-    // viene fornita da AlarmBitmaskManager.
     // ============================================================
-
     uint64_t silencedAlarmMask = 0;
-    
+
     // ============================================================
     // COSTANTI
     // ============================================================
-
     static constexpr size_t EVENT_LOG_MAX = 128;
-
     static constexpr int DEFAULT_CHANNEL_LATENCY_MS = 5;
-
 
     // ============================================================
     // SENSOR CHANNEL -> ALARM TYPE
     // ============================================================
-    //
-    // RT
-    //     Intrusione ordinaria
-    //
-    // H24
-    //     Intrusione 24h
-    //
-    // LEN
-    //     Trouble / supervisione linea
-    //
-    // MASK
-    //     Masking
-    //
-    // ============================================================
-
-    static AlarmType mapSensorAlarmType(
-        SensorChannelType type)
+    static AlarmType mapSensorAlarmType(SensorChannelType type)
     {
-        switch (type)
+        switch(type)
         {
-            case SensorChannelType::RT:
-                return AlarmType::INTRUSION;
-
-            case SensorChannelType::H24:
-                return AlarmType::INTRUSION_H24;
-
-            case SensorChannelType::LEN:
-                return AlarmType::TROUBLE;
-
-            case SensorChannelType::MASK:
-                return AlarmType::MASKING;
-
-            default:
-                return AlarmType::CUSTOM;
+            case SensorChannelType::RT:   return AlarmType::INTRUSION;
+            case SensorChannelType::H24:  return AlarmType::INTRUSION_H24;
+            case SensorChannelType::LEN:  return AlarmType::TROUBLE;
+            case SensorChannelType::MASK: return AlarmType::MASKING;
+            default:                      return AlarmType::CUSTOM;
         }
     }
-
 
     // ============================================================
     // SENSOR CHANNEL + STATE -> EVENT TYPE
     // ============================================================
-    //
-    // true  = attivazione
-    // false = ripristino
-    //
-    // ============================================================
-
     static EventType mapSensorEventType(
         SensorChannelType type,
         bool active)
     {
-        switch (type)
+        switch(type)
         {
             case SensorChannelType::RT:
             case SensorChannelType::H24:
                 return active
                     ? EventType::ALARM_TRIGGERED
                     : EventType::ALARM_RESTORED;
-
 
             case SensorChannelType::LEN:
                 return active
                     ? EventType::TROUBLE
                     : EventType::TROUBLE_RESTORED;
 
-
             case SensorChannelType::MASK:
                 return active
                     ? EventType::MASKING
                     : EventType::MASKING_RESTORED;
-
 
             default:
                 return active
@@ -6461,102 +4834,80 @@ private:
         }
     }
 
-
     // ============================================================
     // EVENT DESCRIPTION
     // ============================================================
-
     static std::string buildSensorDescription(
         const std::string& zone,
         SensorChannelType type,
         bool active)
     {
-        switch (type)
+        const char* text = nullptr;
+
+        switch(type)
         {
             case SensorChannelType::RT:
-
-                return active
-                    ? "Intrusion alarm from zone " + zone
-                    : "Intrusion alarm restored from zone " + zone;
-
+                text = active
+                    ? "Intrusion alarm from zone "
+                    : "Intrusion alarm restored from zone ";
+                break;
 
             case SensorChannelType::H24:
-
-                return active
-                    ? "24h intrusion alarm from zone " + zone
-                    : "24h intrusion alarm restored from zone " + zone;
-
+                text = active
+                    ? "24h intrusion alarm from zone "
+                    : "24h intrusion alarm restored from zone ";
+                break;
 
             case SensorChannelType::LEN:
-
-                return active
-                    ? "Trouble from zone " + zone
-                    : "Trouble restored from zone " + zone;
-
+                text = active
+                    ? "Trouble from zone "
+                    : "Trouble restored from zone ";
+                break;
 
             case SensorChannelType::MASK:
-
-                return active
-                    ? "Masking detected on zone " + zone
-                    : "Masking restored on zone " + zone;
-
+                text = active
+                    ? "Masking detected on zone "
+                    : "Masking restored from zone ";
+                break;
 
             default:
-
-                return active
-                    ? "Alarm from zone " + zone
-                    : "Alarm restored from zone " + zone;
+                text = active
+                    ? "Alarm from zone "
+                    : "Alarm restored from zone ";
+                break;
         }
-    }
 
+        std::string result;
+        result.reserve(std::strlen(text) + zone.size());
+        result = text;
+        result += zone;
+        return result;
+    }
 
     // ============================================================
     // PARTITION VALIDATION
     // ============================================================
-
-    static bool validPartition(
-        int partition)
+    static inline bool validPartition(int partition)
     {
         return partition == 0;
     }
 
-    
-
 public:
-
     // ============================================================
     // SINGLETON
     // ============================================================
-
     static DomoManagerAlarmPanel& instance()
     {
         static DomoManagerAlarmPanel inst;
         return inst;
     }
 
-
     // ============================================================
     // COSTRUTTORE
     // ============================================================
-
     DomoManagerAlarmPanel()
     {
         eventLog.reserve(EVENT_LOG_MAX);
-
-
-        // ============================================================
-        // SECURITY ORCHESTRATOR -> ALARM PANEL
-        // ============================================================
-        //
-        // Il callback riceve:
-        //
-        //   zone     = zona
-        //   type     = RT / H24 / LEN / MASK
-        //   sensors  = sensori coinvolti
-        //   active   = true  -> attivazione
-        //              false -> ripristino
-        //
-        // ============================================================
 
         SecurityOrchestrator::RegisterCallbackAny(
             [this](
@@ -6567,164 +4918,86 @@ public:
             {
                 (void)sensors;
 
-                // --------------------------------------------------------
-                // TROUBLE PER ZONA
-                // --------------------------------------------------------
+                const int index = zoneIndex(zone);
 
-                if (type == SensorChannelType::LEN)
+                if(type == SensorChannelType::LEN &&
+                   index >= 0)
                 {
-                    const int index =
-                        zoneIndex(zone);
-
-
-                    if (index >= 0)
-                    {
-                        if (active)
-                        {
-                            activeTroubleZones.insert(index);
-                        }
-                        else
-                        {
-                            activeTroubleZones.erase(index);
-                        }
-                    }
+                    if(active)
+                        activeTroubleZones.insert(index);
+                    else
+                        activeTroubleZones.erase(index);
                 }
 
-
-                // --------------------------------------------------------
-                // EVENT CREATION
-                // --------------------------------------------------------
-
                 Event ev;
-
-
-                ev.category =
-                    EventCategory::ALARM;
-
-
-                ev.alarmType =
-                    mapSensorAlarmType(type);
-
-
-                ev.type =
-                    mapSensorEventType(
-                        type,
-                        active
-                    );
-
-
-                ev.zone =
-                    zoneIndex(zone);
-
-
-                ev.partition =
-                    0;
-
-
+                ev.category = EventCategory::ALARM;
+                ev.alarmType = mapSensorAlarmType(type);
+                ev.type = mapSensorEventType(type, active);
+                ev.zone = index;
+                ev.partition = 0;
                 ev.description =
-                    buildSensorDescription(
-                        zone,
-                        type,
-                        active
-                    );
-
-
-                ev.timestamp =
-                    millis();
-
-
-                // --------------------------------------------------------
-                // DISPATCH
-                // --------------------------------------------------------
+                    buildSensorDescription(zone, type, active);
+                ev.timestamp = millis();
 
                 emitEvent(ev);
             }
         );
     }
 
-
     // ============================================================
     // IDENTIFICATION
     // ============================================================
-
     const char* getManufacturer() const override
     {
         return "DomoManager";
     }
-
 
     const char* getModel() const override
     {
         return "DomoManager Security Alarm Panel";
     }
 
-
     const char* getFirmwareVersion() const override
     {
         return "UNKNOWN";
     }
-
 
     const char* getSerialNumber() const override
     {
         return "UNKNOWN";
     }
 
-    
     // ============================================================
     // CONNESSIONE / SUPERVISIONE
     // ============================================================
-
     bool connect() override
     {
-        const bool wasFault =
-            commFault;
-
+        const bool wasFault = commFault;
+        const unsigned long now = millis();
 
         connected = true;
-
         commFault = false;
+        lastPoll = now;
+        lastCommunicationOk = now;
 
-        lastPoll = millis();
-
-        lastCommunicationOk =
-            lastPoll;
-
-
-        if (wasFault)
-        {
+        if(wasFault)
             emitCommunicationRestored(
-                lastPoll,
+                now,
                 "Communication restored on connect"
             );
-        }
-
-
-        LOG_IF(
-            "DomoManagerAlarmPanel",
-            "AlarmPanel::connect() "
-            "connected=%d",
-            connected ? 1 : 0
-        );
-
 
         return true;
     }
 
-
     void disconnect() override
     {
-        const unsigned long now =
-            millis();
-
+        const unsigned long now = millis();
 
         connected = false;
 
-
-        if (!commFault)
+        if(!commFault)
         {
             commFault = true;
-
             emitCommunicationFault(
                 now,
                 "Communication disconnected"
@@ -6732,1025 +5005,644 @@ public:
         }
     }
 
-
     bool isConnected() const override
     {
         return connected;
     }
 
-
     // ============================================================
     // COMMUNICATION SUCCESS
-    //
-    // Da chiamare dal driver reale quando riceve correttamente
-    // una risposta dalla centrale.
     // ============================================================
-
     void notifyCommunicationSuccess(
         unsigned long now,
         int latencyMs = DEFAULT_CHANNEL_LATENCY_MS)
     {
-        const bool wasFault =
-            commFault;
-
+        const bool wasFault = commFault;
 
         connected = true;
-
         commFault = false;
 
+        if(latencyMs >= 0)
+            channelLatencyMs = latencyMs;
 
-        if (latencyMs >= 0)
-        {
-            channelLatencyMs =
-                latencyMs;
-        }
+        lastCommunicationOk = now;
 
-
-        lastCommunicationOk =
-            now;
-
-
-        if (wasFault)
-        {
+        if(wasFault)
             emitCommunicationRestored(
                 now,
                 "Communication restored"
             );
-        }
     }
-
 
     // ============================================================
     // COMMUNICATION FAULT
-    //
-    // Da chiamare dal driver reale quando fallisce la supervisione.
     // ============================================================
-
     void notifyCommunicationFault(
         unsigned long now,
-        const char* description =
-            "Communication fault")
+        const char* description = "Communication fault")
     {
-        if (!commFault)
-        {
-            commFault = true;
+        if(commFault)
+            return;
 
+        commFault = true;
 
-            emitCommunicationFault(
-                now,
-                description
-            );
-        }
+        emitCommunicationFault(
+            now,
+            description
+        );
     }
-
 
     bool isCommunicationFault() const override
     {
         return commFault;
     }
 
-
     bool isChannelSupervised() const override
     {
         return true;
     }
-
 
     int getChannelLatencyMs() const override
     {
         return channelLatencyMs;
     }
 
-
     bool hasDualPath() const override
     {
         return false;
     }
 
-
-    bool getPathStatus(
-        int pathIndex) const override
+    bool getPathStatus(int pathIndex) const override
     {
         (void)pathIndex;
         return false;
     }
 
-
     // ============================================================
     // POLL
-    //
-    // Legge lo stato già elaborato da SecurityOrchestrator.
-    //
-    // Non esegue SecurityOrchestrator::Loop():
-    // l'Orchestrator viene eseguito dal SecurityEngine.
-    //
-    // Aggiorna:
-    //     currentMask
-    //     silencedAlarmMask
-    //     effectiveAlarmMask
     // ============================================================
-
-    bool poll(
-        unsigned long now) override
+    bool poll(unsigned long now) override
     {
-        LOG_IF(
-            "SECURITY",
-            "poll BEGIN now=%lu",
-            now
-        );
-
         lastPoll = now;
-
         lastChanges =
             SecurityOrchestrator::getLastChanges();
-
-
-        // ========================================================
-        // CURRENT ALARM MASK
-        // ========================================================
 
         const uint64_t currentMask =
             SecurityOrchestrator::getCurrentAlarmMask();
 
         synchronizeAlarmSilence(currentMask);
 
-
-        // ========================================================
-        // EFFECTIVE ALARM MASK
-        // ========================================================
-
-        const uint64_t effectiveMask =
-            currentMask &
-            ~silencedAlarmMask;
-
-        LOG_IF(
-            "SECURITY",
-            "Alarm masks: "
-            "current=0x%016llX "
-            "silenced=0x%016llX "
-            "effective=0x%016llX",
-            (unsigned long long)currentMask,
-            (unsigned long long)silencedAlarmMask,
-            (unsigned long long)effectiveMask
-        );
-
-
-        // ========================================================
-        // PANEL CHANGE
-        // ========================================================
-
-        if (lastChanges !=
-            SecurityOrchestrator::CHANGE_NONE)
-        {
-            LOG_IF(
-                "SECURITY",
-                "poll setting panelStateChanged=true"
-            );
-
+        if(lastChanges != SecurityOrchestrator::CHANGE_NONE)
             panelStateChanged = true;
-        }
-
-
-        LOG_IF(
-            "SECURITY",
-            "poll BEFORE RETURN changes=%u panelStateChanged=%d",
-            (unsigned)lastChanges,
-            panelStateChanged ? 1 : 0
-        );
-
 
         return lastChanges !=
-            SecurityOrchestrator::CHANGE_NONE;
+               SecurityOrchestrator::CHANGE_NONE;
     }
 
     // ============================================================
     // STATO CENTRALE
     // ============================================================
-    
     size_t getPartitionCount() const override
     {
         return 1;
     }
 
-
     ArmState getArmState(
         int partition = 0) const override
     {
-        if (!validPartition(partition))
-            return ArmState::UNKNOWN;
-
-
-        return armState;
+        return validPartition(partition)
+            ? armState
+            : ArmState::UNKNOWN;
     }
-
 
     // ============================================================
     // READY
-    //
-    // READY operativo della centrale.
-    //
-    // Un allarme corrente già tacitato non impedisce il READY.
-    //
-    // currentMask
-    //     = allarmi correnti
-    //
-    // silencedAlarmMask
-    //     = allarmi correnti già tacitati
-    //
-    // effectiveMask
-    //     = allarmi correnti NON tacitati
     // ============================================================
-
-    bool isReady(
-        int partition = 0) const override
+    bool isReady(int partition = 0) const override
     {
-        if (!validPartition(partition))
+        if(!validPartition(partition))
             return false;
-
 
         const uint64_t currentMask =
             SecurityOrchestrator::getCurrentAlarmMask();
 
-
-        const uint64_t validSilencedMask =
-            silencedAlarmMask &
-            currentMask;
-
-
-        const uint64_t effectiveMask =
-            currentMask &
-            ~validSilencedMask;
-
-
-        return effectiveMask == 0;
+        return (currentMask & ~silencedAlarmMask) == 0;
     }
-
 
     // ============================================================
     // READY FOR ARM
-    //
-    // Determina se la centrale può essere inserita.
-    //
-    // NON utilizza la silencedAlarmMask.
-    // NON utilizza le memorie di allarme.
-    //
-    // Una porta o finestra aperta impedisce l'inserimento.
-    //
     // ============================================================
-
-    bool isReadyForArm(
-        int partition = 0) const
+    bool isReadyForArm(int partition = 0) const
     {
-        if (!validPartition(partition))
+        if(!validPartition(partition))
             return false;
 
+        auto& ws =
+            SecurityOrchestrator::getWiredSensors();
 
-        const auto st =
-            SecurityOrchestrator::
-                getWiredSensors()
-                .ComputeAggregate();
-
+        const auto state =
+            ws.ComputeAggregate();
 
         // --------------------------------------------------------
-        // PORTE / FINESTRE APERTE
-        //
-        // Questi sono stati correnti, non memorie.
+        // PORTE / FINESTRE
         // --------------------------------------------------------
 
-        if (st.normal.windowsOpen ||
-            st.normal.doorsOpen)
+        if(state.normal.windowsOpen ||
+        state.normal.doorsOpen)
         {
             return false;
         }
 
+        // --------------------------------------------------------
+        // AVARIE DEI SENSORI
+        //
+        // L'avaria blocca l'inserimento solo se il sensore è
+        // abilitato e appartiene a una zona abilitata.
+        //
+        // Sensore disabilitato -> non blocca
+        // Zona disabilitata    -> non blocca
+        // --------------------------------------------------------
+
+        const auto* cfg =
+            ws.GetConfig();
+
+        if(!cfg)
+            return false;
+
+        for(size_t i = 0;
+            i < ws.Count();
+            ++i)
+        {
+            const Sensor* sensor =
+                ws.GetSensor(i);
+
+            if(!sensor ||
+            !sensor->IsEnabled())
+            {
+                continue;
+            }
+
+            if(!SecurityOrchestrator::IsSensorAnomaly(i))
+                continue;
+
+            const char* zone =
+                cfg[i].zone;
+
+            if(zone &&
+            zone[0] &&
+            !ws.Zones().IsZoneEnabled(zone))
+            {
+                continue;
+            }
+
+            return false;
+        }
+
+        // --------------------------------------------------------
+        // AVARIE ZONA
+        //
+        // Una zona abilitata con anomalia blocca l'inserimento.
+        // Una zona disabilitata viene ignorata.
+        // --------------------------------------------------------
+
+        for(size_t i = 0;
+            i < ws.GetZoneCount();
+            ++i)
+        {
+            const char* zone =
+                ws.GetZoneName(i);
+
+            if(!zone || !zone[0])
+                continue;
+
+            if(!ws.Zones().IsZoneEnabled(zone))
+                continue;
+
+            if(SecurityOrchestrator::IsZoneAnomaly(i))
+                return false;
+        }
 
         return true;
     }
 
-
+private:
     // ============================================================
-    // ARM AWAY
+    // ARM COMMON
     // ============================================================
-
-    bool armAway(
-        int partition = 0) override
+    bool arm(
+        ArmState state,
+        int partition,
+        const char* description)
     {
-        if (!validPartition(partition))
+        if(!validPartition(partition))
             return false;
 
-
-        if (!isReadyForArm(partition))
+        if(!isReadyForArm(partition))
         {
             LOG_EF(
                 "DomoManagerAlarmPanel",
-                "ARM AWAY rejected: partition %d not ready for arm",
+                "ARM rejected: partition %d not ready for arm",
                 partition
             );
-
             return false;
         }
 
-
-        // Nuovo ciclo di inserimento:
-        // la tacitazione precedente non deve essere ereditata.
-
         silencedAlarmMask = 0;
-       
-        const ArmState state =
-            ArmState::ARMED_AWAY;
+        armState = state;
 
+        const unsigned long now = millis();
 
-        setArmState(
-            state
+        SecurityOrchestrator::ForceSecurityCommands(
+            state,
+            now
         );
 
-
-        SecurityOrchestrator::
-            ForceSecurityCommands(
-                state,
-                millis()
-            );
-
-
         emitPartitionChanged(
+            partition,
+            description,
+            now
+        );
+
+        return true;
+    }
+
+public:
+    // ============================================================
+    // ARM AWAY / STAY / NIGHT
+    // ============================================================
+    bool armAway(int partition = 0) override
+    {
+        return arm(
+            ArmState::ARMED_AWAY,
             partition,
             "ARM AWAY"
         );
-
-
-        return true;
     }
 
-
-    // ============================================================
-    // ARM STAY
-    // ============================================================
-
-    bool armStay(
-        int partition = 0) override
+    bool armStay(int partition = 0) override
     {
-        if (!validPartition(partition))
-            return false;
-
-
-        if (!isReadyForArm(partition))
-        {
-            LOG_EF(
-                "DomoManagerAlarmPanel",
-                "ARM STAY rejected: partition %d not ready for arm",
-                partition
-            );
-
-            return false;
-        }
-
-
-        // Nuovo ciclo di inserimento:
-        // la tacitazione precedente non deve essere ereditata.
-
-        silencedAlarmMask = 0;
-        
-        const ArmState state =
-            ArmState::ARMED_STAY;
-
-
-        setArmState(
-            state
-        );
-
-
-        SecurityOrchestrator::
-            ForceSecurityCommands(
-                state,
-                millis()
-            );
-
-
-        emitPartitionChanged(
+        return arm(
+            ArmState::ARMED_STAY,
             partition,
             "ARM STAY"
         );
-
-
-        return true;
     }
 
-
-    // ============================================================
-    // ARM NIGHT
-    // ============================================================
-
-    bool armNight(
-        int partition = 0) override
+    bool armNight(int partition = 0) override
     {
-        if (!validPartition(partition))
-            return false;
-
-
-        if (!isReadyForArm(partition))
-        {
-            LOG_EF(
-                "DomoManagerAlarmPanel",
-                "ARM NIGHT rejected: partition %d not ready for arm",
-                partition
-            );
-
-            return false;
-        }
-
-
-        // Nuovo ciclo di inserimento:
-        // la tacitazione precedente non deve essere ereditata.
-
-        silencedAlarmMask = 0;
-        
-        const ArmState state =
-            ArmState::ARMED_NIGHT;
-
-
-        setArmState(
-            state
-        );
-
-
-        SecurityOrchestrator::
-            ForceSecurityCommands(
-                state,
-                millis()
-            );
-
-
-        emitPartitionChanged(
+        return arm(
+            ArmState::ARMED_NIGHT,
             partition,
             "ARM NIGHT"
         );
-
-
-        return true;
     }
-
 
     // ============================================================
     // DISARM
-    //
-    // Disinserisce la centrale e forza lo stato di sicurezza
-    // a DISARMED.
-    //
-    // Il disarmo è sempre consentito e non modifica la memoria
-    // di tacitazione dell'episodio di allarme corrente.
     // ============================================================
-
-    
-    bool disarm(
-        int partition = 0) override
+    bool disarm(int partition = 0) override
     {
-        if (!validPartition(partition))
+        if(!validPartition(partition))
             return false;
 
+        armState = ArmState::DISARMED;
 
-        const ArmState state =
-            ArmState::DISARMED;
+        const unsigned long now = millis();
 
-
-        setArmState(
-            state
+        SecurityOrchestrator::ForceSecurityCommands(
+            ArmState::DISARMED,
+            now
         );
-
-
-        SecurityOrchestrator::
-            ForceSecurityCommands(
-                state,
-                millis()
-            );
-
 
         emitPartitionChanged(
             partition,
-            "DISARM"
+            "DISARM",
+            now
         );
-
-
-        LOG_IF(
-            "DomoManagerAlarmPanel",
-            "DISARM accepted: partition=%d",
-            partition
-        );
-
 
         return true;
     }
 
     // ============================================================
     // SILENCE ALARM
-    //
-    // Tacita gli allarmi attualmente attivi ma non ancora
-    // tacitati.
-    //
-    // Inoltre cancella dalla memoria centrale SOLO i bit
-    // corrispondenti agli allarmi tacitati.
-    //
     // ============================================================
-    
-    bool silenceAlarm(
-        uint8_t partition)
+    bool silenceAlarm(uint8_t partition)
     {
+        // ----------------------------------------------------
+        // Allarmi realtime attualmente presenti
+        // ----------------------------------------------------
+
         const uint64_t currentMask =
             SecurityOrchestrator::getCurrentAlarmMask();
+
+        // ----------------------------------------------------
+        // Memorie allarme attualmente presenti
+        // ----------------------------------------------------
 
         const uint64_t memoryMask =
             SecurityOrchestrator::getAlarmMemoryMask();
 
+        // ----------------------------------------------------
+        // Episodio complessivo:
+        // realtime ancora attivi +
+        // memorie già registrate
+        // ----------------------------------------------------
+
         const uint64_t episodeMask =
-            currentMask |
-            memoryMask;
+            currentMask | memoryMask;
+
+        // ----------------------------------------------------
+        // Considera solo gli allarmi che non sono
+        // già stati tacitati in precedenza.
+        // ----------------------------------------------------
 
         const uint64_t unsilencedMask =
-            episodeMask &
-            ~silencedAlarmMask;
+            episodeMask & ~silencedAlarmMask;
 
+        // ----------------------------------------------------
+        // Nessun nuovo allarme da tacitare.
+        // ----------------------------------------------------
 
-        if (unsilencedMask == 0)
+        if(unsilencedMask == 0)
             return false;
 
+        // ----------------------------------------------------
+        // Memorizza gli allarmi tacitati.
+        //
+        // Gli eventi già riconosciuti non dovranno
+        // più riattivare la sirena fino a quando
+        // non rientreranno completamente.
+        // ----------------------------------------------------
 
-        silencedAlarmMask |=
-            unsilencedMask;
+        silencedAlarmMask |= unsilencedMask;
 
+        // ----------------------------------------------------
+        // Marca nel bitmask manager tutti gli eventi
+        // attualmente attivi come "silenziati".
+        //
+        // Se il sensore rimane in allarme:
+        //    RT = YES
+        //
+        // non verrà rigenerato un nuovo episodio.
+        //
+        // Quando il sensore rientra:
+        //    RT = NO
+        //
+        // il silenziamento verrà automaticamente
+        // eliminato dal relativo bit.
+        // ----------------------------------------------------
+
+        SecurityOrchestrator::SilenceCurrentAlarms();
+
+        // ----------------------------------------------------
+        // Cancella le memorie centrali associate
+        // agli eventi appena riconosciuti.
+        // ----------------------------------------------------
 
         SecurityOrchestrator::ResetAlarmMemory(
             unsilencedMask
         );
-
-
-        const uint64_t effectiveMask =
-            episodeMask &
-            ~silencedAlarmMask;
-
-
-        LOG_IF(
-            "DomoManagerAlarmPanel",
-            "SILENCE ALARM: "
-            "current=0x%016llX "
-            "memory=0x%016llX "
-            "episode=0x%016llX "
-            "silenced=0x%016llX "
-            "memoryReset=0x%016llX "
-            "effective=0x%016llX",
-            static_cast<unsigned long long>(
-                currentMask),
-            static_cast<unsigned long long>(
-                memoryMask),
-            static_cast<unsigned long long>(
-                episodeMask),
-            static_cast<unsigned long long>(
-                silencedAlarmMask),
-            static_cast<unsigned long long>(
-                unsilencedMask),
-            static_cast<unsigned long long>(
-                effectiveMask)
-        );
-
 
         (void)partition;
 
         return true;
     }
 
-
     void synchronizeAlarmSilence(uint64_t currentMask)
     {
-        const uint64_t oldSilencedMask = silencedAlarmMask;
-
         silencedAlarmMask &= currentMask;
-
-        if (oldSilencedMask != silencedAlarmMask)
-        {
-            LOG_IF(
-                "DomoManagerAlarmPanel",
-                "SYNC SILENCED MASK: "
-                "current=0x%016llX "
-                "old=0x%016llX "
-                "new=0x%016llX",
-                static_cast<unsigned long long>(currentMask),
-                static_cast<unsigned long long>(oldSilencedMask),
-                static_cast<unsigned long long>(silencedAlarmMask)
-            );
-        }
     }
 
-    
     // ============================================================
     // ZONE STATE
     // ============================================================
-
-    bool getZoneState(
-        int zone) const override
+    bool getZoneState(int zone) const override
     {
-        const auto& zoneMap =
-            SecurityOrchestrator::
-                getWiredSensors()
-                .GetZoneMap();
-
-
-        if (zone < 0 ||
-            zone >= static_cast<int>(zoneMap.size()))
-        {
+        if(!validZone(zone))
             return false;
-        }
 
+        const auto& ws =
+            SecurityOrchestrator::getWiredSensors();
 
-        int index = 0;
+        const char* zoneName =
+            ws.GetZoneName(static_cast<size_t>(zone));
 
-
-        for (const auto& entry :
-             zoneMap)
-        {
-            if (index == zone)
-            {
-                return SecurityOrchestrator::
-                    getWiredSensors()
-                    .Zones()
-                    .ZoneAlarm(entry.first);
-            }
-
-            ++index;
-        }
-
-
-        return false;
+        return zoneName &&
+               ws.Zones().ZoneAlarm(zoneName);
     }
-
 
     // ============================================================
     // ZONE TAMPER
-    //
-    // Il backend attuale non espone una lettura per-zona del
-    // tamper. Manteniamo quindi un set esplicito aggiornabile
-    // dal driver tramite notifyZoneTamper().
     // ============================================================
-
-    bool getZoneTamper(
-        int zone) const override
+    bool getZoneTamper(int zone) const override
     {
-        if (!validZone(zone))
-            return false;
-
-
-        return activeTamperZones.count(zone) > 0;
+        return validZone(zone) &&
+               activeTamperZones.find(zone) !=
+                   activeTamperZones.end();
     }
-
 
     // ============================================================
     // ZONE TROUBLE
-    //
-    // LEN viene mantenuto per zona dal callback SecurityOrchestrator.
     // ============================================================
-
-    bool getZoneTrouble(
-        int zone) const override
+    bool getZoneTrouble(int zone) const override
     {
-        if (!validZone(zone))
-            return false;
-
-
-        return activeTroubleZones.count(zone) > 0;
+        return validZone(zone) &&
+               (
+                   activeTroubleZones.find(zone) !=
+                       activeTroubleZones.end() ||
+                   SecurityOrchestrator::IsZoneAnomaly(
+                       static_cast<size_t>(zone)
+                   )
+               );
     }
 
-
-    bool isZoneBypassed(
-        int zone) const override
+    bool isZoneBypassed(int zone) const override
     {
-        if (!validZone(zone))
-            return false;
-
-
-        return bypassedZones.count(zone) > 0;
+        return validZone(zone) &&
+               bypassedZones.find(zone) !=
+                   bypassedZones.end();
     }
-
 
     size_t getZoneCount() const override
     {
-        return SecurityOrchestrator::
-            getWiredSensors()
-            .GetZoneMap()
-            .size();
+        return SecurityOrchestrator::getWiredSensors()
+            .GetZoneCount();
     }
-
 
     // ============================================================
     // ZONE TAMPER NOTIFICATION
-    //
-    // Hook per il layer che dispone del vero stato tamper
-    // per-zona.
     // ============================================================
-
     void notifyZoneTamper(
         int zone,
         bool active,
         unsigned long now = 0)
     {
-        if (!validZone(zone))
+        if(!validZone(zone))
             return;
 
-
-        if (active)
+        if(active)
             activeTamperZones.insert(zone);
         else
             activeTamperZones.erase(zone);
 
-
         Event ev;
 
-        ev.category =
-            EventCategory::ALARM;
-
-
-        ev.type =
-            active
-                ? EventType::TAMPER
-                : EventType::TAMPER_RESTORED;
-
-
-        ev.alarmType =
-            AlarmType::TAMPER;
-
-
-        ev.zone =
-            zone;
-
-
-        ev.partition =
-            0;
-
-
-        ev.description =
-            active
-                ? "Tamper active"
-                : "Tamper restored";
-
-
-        ev.timestamp =
-            now != 0
-                ? now
-                : millis();
-
+        ev.category = EventCategory::ALARM;
+        ev.type = active
+            ? EventType::TAMPER
+            : EventType::TAMPER_RESTORED;
+        ev.alarmType = AlarmType::TAMPER;
+        ev.zone = zone;
+        ev.partition = 0;
+        ev.description = active
+            ? "Tamper active"
+            : "Tamper restored";
+        ev.timestamp = now ? now : millis();
 
         emitEvent(ev);
     }
-
 
     // ============================================================
     // BYPASS
     // ============================================================
-
-    bool bypassZone(
-        int zone) override
+    bool bypassZone(int zone) override
     {
-        if (!validZone(zone))
+        if(!validZone(zone))
             return false;
 
-
-        const auto result =
-            bypassedZones.insert(zone);
-
-
-        // Idempotente:
-        // se già bypassata, operazione considerata riuscita,
-        // ma non generiamo un nuovo evento.
-        if (!result.second)
+        if(!bypassedZones.insert(zone).second)
             return true;
 
-
         Event ev;
 
-        ev.category =
-            EventCategory::APPLICATION;
-
-
-        ev.type =
-            EventType::ZONE_BYPASSED;
-
-
-        ev.zone =
-            zone;
-
-
-        ev.partition =
-            0;
-
-
-        ev.description =
-            "Zone bypassed";
-
-
-        ev.timestamp =
-            millis();
-
+        ev.category = EventCategory::APPLICATION;
+        ev.type = EventType::ZONE_BYPASSED;
+        ev.zone = zone;
+        ev.partition = 0;
+        ev.description = "Zone bypassed";
+        ev.timestamp = millis();
 
         emitEvent(ev);
-
-
         return true;
     }
 
-
-    bool clearBypass(
-        int zone) override
+    bool clearBypass(int zone) override
     {
-        if (!validZone(zone))
+        if(!validZone(zone) ||
+           bypassedZones.erase(zone) == 0)
+        {
             return false;
-
-
-        const size_t removed =
-            bypassedZones.erase(zone);
-
-
-        if (removed == 0)
-            return false;
-
+        }
 
         Event ev;
 
-        ev.category =
-            EventCategory::APPLICATION;
-
-
-        ev.type =
-            EventType::ZONE_BYPASS_CLEARED;
-
-
-        ev.zone =
-            zone;
-
-
-        ev.partition =
-            0;
-
-
-        ev.description =
-            "Zone bypass cleared";
-
-
-        ev.timestamp =
-            millis();
-
+        ev.category = EventCategory::APPLICATION;
+        ev.type = EventType::ZONE_BYPASS_CLEARED;
+        ev.zone = zone;
+        ev.partition = 0;
+        ev.description = "Zone bypass cleared";
+        ev.timestamp = millis();
 
         emitEvent(ev);
-
-
         return true;
     }
 
-
     // ============================================================
-    // GLOBAL TAMPER
+    // GLOBAL TAMPER / TROUBLE
     // ============================================================
-
     bool getGlobalTamper() const override
     {
-        return SecurityOrchestrator::
-            getWiredSensors()
+        return SecurityOrchestrator::getWiredSensors()
             .ComputeAggregate()
             .tamper;
     }
-
-
-    // ============================================================
-    // GLOBAL TROUBLE
-    //
-    // Derivato dai trouble LEN mantenuti per-zona.
-    // ============================================================
 
     bool getGlobalTrouble() const override
     {
         return !activeTroubleZones.empty();
     }
 
-
     // ============================================================
     // AUTHENTICATION PROVIDER
     // ============================================================
-    //
-    // Nessun PIN hardcoded.
-    //
-    // Il backend può essere configurato dall'esterno.
-    // ============================================================
-
     using AuthenticationProvider =
         std::function<bool(
             const std::string& user,
             const std::string& pin)>;
-
 
     using PermissionProvider =
         std::function<bool(
             const std::string& user,
             const std::string& action)>;
 
-
     void setAuthenticationProvider(
         AuthenticationProvider provider)
     {
         authenticationProvider =
-            provider;
+            std::move(provider);
     }
-
 
     void setPermissionProvider(
         PermissionProvider provider)
     {
         permissionProvider =
-            provider;
+            std::move(provider);
     }
-
 
     // ============================================================
     // AUTHENTICATE USER
     // ============================================================
-
     bool authenticateUser(
         const std::string& user,
         const std::string& pin) override
     {
-        bool authenticated =
-            false;
+        const bool authenticated =
+            authenticationProvider
+                ? authenticationProvider(user, pin)
+                : false;
 
-
-        if (authenticationProvider)
-        {
-            authenticated =
-                authenticationProvider(
-                    user,
-                    pin
-                );
-        }
-        else
+        if(!authenticationProvider)
         {
             LOG_EF(
                 "DomoManagerAlarmPanel",
                 "Authentication provider not configured"
             );
-
-            authenticated =
-                false;
         }
-
 
         Event ev;
 
-        ev.category =
-            EventCategory::APPLICATION;
-
-
-        ev.type =
-            authenticated
-                ? EventType::USER_AUTH_OK
-                : EventType::USER_AUTH_FAIL;
-
-
+        ev.category = EventCategory::APPLICATION;
+        ev.type = authenticated
+            ? EventType::USER_AUTH_OK
+            : EventType::USER_AUTH_FAIL;
         ev.zone = -1;
-
         ev.partition = -1;
-
-        ev.user =
-            user;
-
-
-        ev.description =
-            authenticated
-                ? "Authentication successful"
-                : "Authentication failed";
-
-
-        ev.timestamp =
-            millis();
-
+        ev.user = user;
+        ev.description = authenticated
+            ? "Authentication successful"
+            : "Authentication failed";
+        ev.timestamp = millis();
 
         emitEvent(ev);
-
 
         return authenticated;
     }
 
-
     // ============================================================
     // PERMISSIONS
     // ============================================================
-
     bool hasPermission(
         const std::string& user,
         const std::string& action) const override
     {
-        if (!permissionProvider)
+        if(!permissionProvider)
         {
             LOG_EF(
                 "DomoManagerAlarmPanel",
                 "Permission provider not configured"
             );
-
             return false;
         }
-
 
         return permissionProvider(
             user,
@@ -7758,53 +5650,42 @@ public:
         );
     }
 
-
     // ============================================================
     // EVENT CALLBACKS
     // ============================================================
-
     void setAlarmCallback(
         AlarmCallback cb) override
     {
-        alarmCallback =
-            cb;
+        alarmCallback = std::move(cb);
     }
-
 
     void setEventCallback(
         EventCallback cb) override
     {
-        callback =
-            cb;
+        callback = std::move(cb);
     }
-
 
     // ============================================================
     // EVENT LOG
     // ============================================================
-
     std::vector<Event> getEventLog() const override
     {
         return eventLog;
     }
-
 
     void clearEventLog() override
     {
         eventLog.clear();
     }
 
-
     size_t getEventCount() const
     {
         return eventLog.size();
     }
 
-
     // ============================================================
     // DIAGNOSTICA
     // ============================================================
-
     void diagnostic() const override
     {
         LOG_IF(
@@ -7812,58 +5693,39 @@ public:
             "================================================"
         );
 
-
         LOG_IF(
             "DomoManagerAlarmPanel",
             "       DOMOMANAGER ALARM PANEL DIAGNOSTICS"
         );
-
 
         LOG_IF(
             "DomoManagerAlarmPanel",
             "================================================"
         );
 
-
-        // --------------------------------------------------------
-        // PANEL
-        // --------------------------------------------------------
-
         LOG_IF(
             "DomoManagerAlarmPanel",
             "Connected            : %s",
-            connected
-                ? "YES"
-                : "NO"
+            connected ? "YES" : "NO"
         );
-
 
         LOG_IF(
             "DomoManagerAlarmPanel",
             "Communication fault  : %s",
-            commFault
-                ? "ACTIVE"
-                : "OK"
+            commFault ? "ACTIVE" : "OK"
         );
-
 
         LOG_IF(
             "DomoManagerAlarmPanel",
             "Arm state            : %s",
-            armStateToString(
-                armState
-            )
+            armStateToString(armState)
         );
-
 
         LOG_IF(
             "DomoManagerAlarmPanel",
             "Channel supervised   : %s",
-            isChannelSupervised()
-                ? "YES"
-                : "NO"
+            isChannelSupervised() ? "YES" : "NO"
         );
-
 
         LOG_IF(
             "DomoManagerAlarmPanel",
@@ -7871,13 +5733,11 @@ public:
             channelLatencyMs
         );
 
-
         LOG_IF(
             "DomoManagerAlarmPanel",
             "Last poll            : %lu",
             lastPoll
         );
-
 
         LOG_IF(
             "DomoManagerAlarmPanel",
@@ -7885,26 +5745,17 @@ public:
             lastCommunicationOk
         );
 
-
         LOG_IF(
             "DomoManagerAlarmPanel",
             "Last changes         : 0x%02X",
             (unsigned)lastChanges
         );
 
-
         LOG_IF(
             "DomoManagerAlarmPanel",
             "Panel state changed  : %s",
-            panelStateChanged
-                ? "YES"
-                : "NO"
+            panelStateChanged ? "YES" : "NO"
         );
-
-
-        // --------------------------------------------------------
-        // ZONES
-        // --------------------------------------------------------
 
         LOG_IF(
             "DomoManagerAlarmPanel",
@@ -7912,13 +5763,11 @@ public:
             (unsigned)getZoneCount()
         );
 
-
         LOG_IF(
             "DomoManagerAlarmPanel",
             "Bypassed zones       : %u",
             (unsigned)bypassedZones.size()
         );
-
 
         LOG_IF(
             "DomoManagerAlarmPanel",
@@ -7926,48 +5775,29 @@ public:
             (unsigned)activeTamperZones.size()
         );
 
-
         LOG_IF(
             "DomoManagerAlarmPanel",
             "Trouble zones        : %u",
             (unsigned)activeTroubleZones.size()
         );
 
-
-        // --------------------------------------------------------
-        // SECURITY
-        // --------------------------------------------------------
-
         LOG_IF(
             "DomoManagerAlarmPanel",
             "Global tamper        : %s",
-            getGlobalTamper()
-                ? "ACTIVE"
-                : "OK"
+            getGlobalTamper() ? "ACTIVE" : "OK"
         );
-
 
         LOG_IF(
             "DomoManagerAlarmPanel",
             "Global trouble       : %s",
-            getGlobalTrouble()
-                ? "ACTIVE"
-                : "OK"
+            getGlobalTrouble() ? "ACTIVE" : "OK"
         );
-
 
         LOG_IF(
             "DomoManagerAlarmPanel",
             "Ready                : %s",
-            isReady(0)
-                ? "YES"
-                : "NO"
+            isReady(0) ? "YES" : "NO"
         );
-
-
-        // --------------------------------------------------------
-        // EVENT LOG
-        // --------------------------------------------------------
 
         LOG_IF(
             "DomoManagerAlarmPanel",
@@ -7976,26 +5806,16 @@ public:
             (unsigned)EVENT_LOG_MAX
         );
 
-
-        // --------------------------------------------------------
-        // SECURITY ORCHESTRATOR
-        // --------------------------------------------------------
-
         SecurityOrchestrator::Report(
-            SecurityOrchestrator::
-                ReportMode::CORE
+            SecurityOrchestrator::ReportMode::CORE
         );
 
-
         SecurityOrchestrator::Report(
-            SecurityOrchestrator::
-                ReportMode::SECURITY
+            SecurityOrchestrator::ReportMode::SECURITY
         );
 
-
         SecurityOrchestrator::Report(
-            SecurityOrchestrator::
-                ReportMode::INCONSISTENCIES
+            SecurityOrchestrator::ReportMode::INCONSISTENCIES
         );
 
         LOG_IF(
@@ -8007,24 +5827,19 @@ public:
     // ============================================================
     // SYSTEM BITMASK
     // ============================================================
-
     int getSystemBitmask() const override
     {
-        return SecurityOrchestrator::
-            getSystem()
+        return SecurityOrchestrator::getSystem()
             .getBitmask();
     }
-
 
     // ============================================================
     // LAST CHANGES
     // ============================================================
-
     uint8_t getLastChanges() const
     {
         return lastChanges;
     }
-
 
     void clearPanelStateChanged()
     {
@@ -8034,286 +5849,137 @@ public:
     // ============================================================
     // SILENCED ALARM MASK
     // ============================================================
-
     uint64_t getSilencedAlarmMask() const
     {
         return silencedAlarmMask;
     }
 
-
     // ============================================================
     // EFFECTIVE ALARM MASK
-    //
-    // current XOR silenced
     // ============================================================
-
     uint64_t getEffectiveAlarmMask() const
     {
-        const uint64_t currentMask =
-            SecurityOrchestrator::getCurrentAlarmMask();
-
-        const uint64_t memoryMask =
+        const uint64_t episodeMask =
+            SecurityOrchestrator::getCurrentAlarmMask() |
             SecurityOrchestrator::getAlarmMemoryMask();
 
-        const uint64_t episodeMask =
-            currentMask |
-            memoryMask;
-
-        const uint64_t effectiveMask =
-            episodeMask &
-            ~silencedAlarmMask;
-
-        return effectiveMask;
+        return episodeMask & ~silencedAlarmMask;
     }
 
-
-
 private:
-
     // ============================================================
     // RUNTIME STATE
     // ============================================================
-
     bool connected = false;
-
     bool commFault = false;
 
-
-    // ------------------------------------------------------------
-    // Arm state separato dallo stato allarme
-    // ------------------------------------------------------------
-
-    ArmState armState =
-        ArmState::DISARMED;
-
-
-    // ------------------------------------------------------------
-    // Poll / communication
-    // ------------------------------------------------------------
+    ArmState armState = ArmState::DISARMED;
 
     unsigned long lastPoll = 0;
-
     unsigned long lastCommunicationOk = 0;
-
-
     int channelLatencyMs =
         DEFAULT_CHANNEL_LATENCY_MS;
-
-
-    // ------------------------------------------------------------
-    // Runtime changes
-    // ------------------------------------------------------------
 
     uint8_t lastChanges =
         SecurityOrchestrator::CHANGE_NONE;
 
-
-    bool panelStateChanged =
-        false;
-
+    bool panelStateChanged = false;
 
     // ============================================================
     // ZONE STATE
     // ============================================================
-
     std::set<int> bypassedZones;
-
     std::set<int> activeTamperZones;
-
     std::set<int> activeTroubleZones;
-
 
     // ============================================================
     // CALLBACKS
     // ============================================================
-
     AlarmCallback alarmCallback = nullptr;
-
     EventCallback callback = nullptr;
-
 
     // ============================================================
     // PROVIDERS
     // ============================================================
-
-    AuthenticationProvider authenticationProvider =
-        nullptr;
-
-
-    PermissionProvider permissionProvider =
-        nullptr;
-
+    AuthenticationProvider authenticationProvider = nullptr;
+    PermissionProvider permissionProvider = nullptr;
 
     // ============================================================
     // EVENT LOG
     // ============================================================
-
     std::vector<Event> eventLog;
-
-
-    // ============================================================
-    // SET ARM STATE
-    // ============================================================
-
-    void setArmState(
-        ArmState newState)
-    {
-        armState =
-            newState;
-    }
-
 
     // ============================================================
     // VALID ZONE
     // ============================================================
-
-    bool validZone(
-        int zone) const
+    inline bool validZone(int zone) const
     {
         return zone >= 0 &&
-               zone <
-                   static_cast<int>(
-                       getZoneCount()
-                   );
+               static_cast<size_t>(zone) < getZoneCount();
     }
-
 
     // ============================================================
     // ZONE NAME -> INDEX
-    //
-    // Mantiene la stessa convenzione utilizzata da getZoneState().
-    //
-    // La numerazione deriva dall'ordine della mappa del manager.
+    // Usa la cache di WiredSensorsManager.
     // ============================================================
-
-    int zoneIndex(
-        const std::string& zoneName) const
+    inline int zoneIndex(const std::string& zoneName) const
     {
-        int index = 0;
-
-
-        const auto& zoneMap =
-            SecurityOrchestrator::
-                getWiredSensors()
-                .GetZoneMap();
-
-
-        for (const auto& entry :
-             zoneMap)
-        {
-            if (entry.first ==
-                zoneName)
-            {
-                return index;
-            }
-
-
-            ++index;
-        }
-
-
-        return -1;
+        return SecurityOrchestrator::getWiredSensors()
+            .GetZoneIndex(zoneName.c_str());
     }
-
 
     // ============================================================
     // EVENT LOG APPEND
-    //
-    // Buffer limitato.
-    //
-    // Quando pieno, viene eliminato l'evento più vecchio.
     // ============================================================
-
-    void appendEvent(
-        const Event& ev)
+    void appendEvent(const Event& ev)
     {
-        if (eventLog.size() >=
-            EVENT_LOG_MAX)
-        {
-            eventLog.erase(
-                eventLog.begin()
-            );
-        }
-
+        if(eventLog.size() >= EVENT_LOG_MAX)
+            eventLog.erase(eventLog.begin());
 
         eventLog.push_back(ev);
     }
 
-
     // ============================================================
     // EVENT DISPATCH
-    //
-    // 1. salva nel log
-    // 2. invia callback ALARM
-    // 3. invia callback APPLICATION
     // ============================================================
-
-    void emitEvent(
-        const Event& ev)
+    void emitEvent(const Event& ev)
     {
         appendEvent(ev);
 
-
-        if (ev.category ==
-            EventCategory::ALARM)
+        if(ev.category == EventCategory::ALARM)
         {
-            if (alarmCallback)
+            if(alarmCallback)
                 alarmCallback(ev);
 
             return;
         }
 
-
-        if (callback)
+        if(callback)
             callback(ev);
     }
 
-
     // ============================================================
-    // COMMUNICATION FAULT EVENT
+    // COMMUNICATION EVENTS
     // ============================================================
-
     void emitCommunicationFault(
         unsigned long now,
         const char* description)
     {
         Event ev;
 
-
-        ev.category =
-            EventCategory::ALARM;
-
-
-        ev.type =
-            EventType::COMM_FAULT;
-
-
-        ev.alarmType =
-            AlarmType::COMMUNICATION;
-
-
+        ev.category = EventCategory::ALARM;
+        ev.type = EventType::COMM_FAULT;
+        ev.alarmType = AlarmType::COMMUNICATION;
         ev.zone = -1;
-
         ev.partition = -1;
-
-
         ev.description =
             description
                 ? description
                 : "Communication fault";
-
-
-        ev.timestamp =
-            now;
-
+        ev.timestamp = now;
 
         emitEvent(ev);
     }
-
-
-    // ============================================================
-    // COMMUNICATION RESTORED EVENT
-    // ============================================================
 
     void emitCommunicationRestored(
         unsigned long now,
@@ -8321,116 +5987,68 @@ private:
     {
         Event ev;
 
-
-        ev.category =
-            EventCategory::ALARM;
-
-
-        ev.type =
-            EventType::COMM_RESTORED;
-
-
-        ev.alarmType =
-            AlarmType::COMMUNICATION;
-
-
+        ev.category = EventCategory::ALARM;
+        ev.type = EventType::COMM_RESTORED;
+        ev.alarmType = AlarmType::COMMUNICATION;
         ev.zone = -1;
-
         ev.partition = -1;
-
-
         ev.description =
             description
                 ? description
                 : "Communication restored";
-
-
-        ev.timestamp =
-            now;
-
+        ev.timestamp = now;
 
         emitEvent(ev);
     }
-
 
     // ============================================================
     // PARTITION EVENT
     // ============================================================
-
     void emitPartitionChanged(
         int partition,
-        const char* description)
+        const char* description,
+        unsigned long now = 0)
     {
         Event ev;
 
-        ev.category =
-            EventCategory::APPLICATION;
-
-
-        ev.type =
-            EventType::PARTITION_CHANGED;
-
-
+        ev.category = EventCategory::APPLICATION;
+        ev.type = EventType::PARTITION_CHANGED;
         ev.zone = -1;
-
-        ev.partition =
-            partition;
-
-
+        ev.partition = partition;
         ev.description =
             description
                 ? description
                 : "Partition state changed";
-
-
-        ev.timestamp =
-            millis();
-
+        ev.timestamp = now ? now : millis();
 
         emitEvent(ev);
-
-
-        LOG_DF(
-            "DomoManagerAlarmPanel",
-            "Partition %d -> %s",
-            partition,
-            ev.description.c_str()
-        );
     }
-
 
     // ============================================================
     // ARM STATE -> STRING
     // ============================================================
-
     static const char* armStateToString(
         ArmState state)
     {
-        switch (state)
+        switch(state)
         {
             case ArmState::DISARMED:
                 return "DISARMED";
 
-
             case ArmState::ARMED_STAY:
                 return "ARMED_STAY";
-
 
             case ArmState::ARMED_AWAY:
                 return "ARMED_AWAY";
 
-
             case ArmState::ARMED_NIGHT:
                 return "ARMED_NIGHT";
-
 
             case ArmState::ARMED_PARTIAL:
                 return "ARMED_PARTIAL";
 
-
             case ArmState::NOT_READY:
                 return "NOT_READY";
-
 
             case ArmState::UNKNOWN:
             default:
@@ -8438,7 +6056,6 @@ private:
         }
     }
 };
-
 
 // ============================================================
 // REPORT DIAGNOSTICO ESTERNO
@@ -8459,171 +6076,66 @@ inline bool SecurityOrchestrator::ApplyPanelCommand(
     int area,
     long value)
 {
-    // ============================================================
-    // SECURITY SUBSYSTEM INITIALIZED
-    // ============================================================
+    if(!initialized)
+        return false;
 
-    if (!initialized)
+    const int panelArea =
+        cfgCopy.panelCommandArea;
+
+    if(panelArea < 0 ||
+       area != panelArea)
     {
-        LOG_EF(
-            "SecurityOrchestrator",
-            "ApplyPanelCommand: security not initialized"
-        );
-
         return false;
     }
 
-
-    // ============================================================
-    // PANEL COMMAND AREA
-    // ============================================================
-
-    if (cfgCopy.panelCommandArea < 0)
+    if(value < static_cast<long>(DISARM) ||
+       value > static_cast<long>(ARM_NIGHT))
     {
         LOG_EF(
             "SecurityOrchestrator",
-            "ApplyPanelCommand: panel command area disabled"
-        );
-
-        return false;
-    }
-
-
-    if (area != cfgCopy.panelCommandArea)
-    {
-        LOG_EF(
-            "SecurityOrchestrator",
-            "ApplyPanelCommand: invalid area=%d expected=%d",
-            area,
-            cfgCopy.panelCommandArea
-        );
-
-        return false;
-    }
-
-
-    // ============================================================
-    // VALIDATE COMMAND VALUE
-    //
-    // 0 = DISARM
-    // 1 = ARM_AWAY
-    // 2 = ARM_STAY
-    // 3 = ARM_NIGHT
-    //
-    // ============================================================
-
-    if (value < static_cast<long>(DISARM) ||
-        value > static_cast<long>(ARM_NIGHT))
-    {
-        LOG_EF(
-            "SecurityOrchestrator",
-            "ApplyPanelCommand: invalid command value=%ld area=%d",
+            "ApplyPanelCommand: invalid command=%ld area=%d",
             value,
             area
         );
-
         return false;
     }
-
-
-    const AlarmPanelCommand command =
-        static_cast<AlarmPanelCommand>(value);
-
-
-    // ============================================================
-    // ALARM PANEL
-    // ============================================================
 
     DomoManagerAlarmPanel& panel =
         DomoManagerAlarmPanel::instance();
 
-
     bool result = false;
 
-
-    // ============================================================
-    // APPLY COMMAND
-    // ============================================================
-
-    switch (command)
+    switch(static_cast<AlarmPanelCommand>(value))
     {
         case DISARM:
-        {
-            result =
-                panel.disarm(0);
-
+            result = panel.disarm(0);
             break;
-        }
-
 
         case ARM_AWAY:
-        {
-            result =
-                panel.armAway(0);
-
+            result = panel.armAway(0);
             break;
-        }
-
 
         case ARM_STAY:
-        {
-            result =
-                panel.armStay(0);
-
+            result = panel.armStay(0);
             break;
-        }
-
 
         case ARM_NIGHT:
-        {
-            result =
-                panel.armNight(0);
-
+            result = panel.armNight(0);
             break;
-        }
-
 
         default:
-        {
-            LOG_EF(
-                "SecurityOrchestrator",
-                "ApplyPanelCommand: unsupported command=%ld area=%d",
-                value,
-                area
-            );
-
             return false;
-        }
     }
 
-
-    // ============================================================
-    // RESULT
-    // ============================================================
-
-    if (result)
-    {
-        LOG_IF(
-            "SecurityOrchestrator",
-            "ApplyPanelCommand: "
-            "area=%d value=%ld command=%u result=ACCEPTED",
-            area,
-            value,
-            static_cast<unsigned>(command)
-        );
-    }
-    else
+    if(!result)
     {
         LOG_EF(
             "SecurityOrchestrator",
-            "ApplyPanelCommand: "
-            "area=%d value=%ld command=%u result=FAILED",
+            "ApplyPanelCommand: command failed area=%d value=%ld",
             area,
-            value,
-            static_cast<unsigned>(command)
+            value
         );
     }
-
 
     return result;
 }
@@ -8632,130 +6144,66 @@ inline bool SecurityOrchestrator::ApplyPanelBitCommand(
     int area,
     long value)
 {
-    // ============================================================
-    // SECURITY SUBSYSTEM INITIALIZED
-    // ============================================================
+    if(!initialized)
+        return false;
 
-    if (!initialized)
+    const int panelArea =
+        cfgCopy.panelBitCommandArea;
+
+    if(panelArea < 0 ||
+       area != panelArea)
     {
-        LOG_EF(
-            "SecurityOrchestrator",
-            "ApplyPanelBitCommand: security not initialized"
-        );
-
         return false;
     }
 
-
-    // ============================================================
-    // PANEL BIT COMMAND AREA
-    // ============================================================
-
-    if (cfgCopy.panelBitCommandArea < 0)
+    if(value < 0)
     {
         LOG_EF(
             "SecurityOrchestrator",
-            "ApplyPanelBitCommand: "
-            "panel bit command area disabled"
+            "ApplyPanelBitCommand: invalid value=%ld area=%d",
+            value,
+            area
         );
-
         return false;
     }
-
-
-    if (area != cfgCopy.panelBitCommandArea)
-    {
-        LOG_EF(
-            "SecurityOrchestrator",
-            "ApplyPanelBitCommand: "
-            "invalid area=%d expected=%d",
-            area,
-            cfgCopy.panelBitCommandArea
-        );
-
-        return false;
-    }
-
-
-    // ============================================================
-    // DECODE BIT COMMANDS
-    //
-    // bit 0 = SILENCE_ALARM
-    //
-    // Altri bit riservati per future funzioni.
-    //
-    // ============================================================
 
     const uint32_t bits =
         static_cast<uint32_t>(value);
 
-
     const uint32_t silenceMask =
         (1UL << BITCMD_SILENCE_ALARM);
-
-
-    // ============================================================
-    // UNKNOWN / RESERVED BITS
-    // ============================================================
 
     const uint32_t reservedBits =
         bits & ~silenceMask;
 
-
-    if (reservedBits != 0)
+    if(reservedBits != 0)
     {
         LOG_WF(
             "SecurityOrchestrator",
-            "ApplyPanelBitCommand: "
-            "reserved bits set "
-            "area=%d value=0x%08lX "
-            "reserved=0x%08lX",
+            "ApplyPanelBitCommand: reserved bits "
+            "area=%d value=0x%08lX reserved=0x%08lX",
             area,
             (unsigned long)bits,
             (unsigned long)reservedBits
         );
     }
 
-
-    // ============================================================
-    // SILENCE ALARM
-    // ============================================================
-
-    if (bits &
-        silenceMask)
+    if(bits & silenceMask)
     {
-        DomoManagerAlarmPanel& panel =
-            DomoManagerAlarmPanel::instance();
-
-
         const bool result =
-            panel.silenceAlarm(0);
+            DomoManagerAlarmPanel::instance()
+                .silenceAlarm(0);
 
-
-        LOG_IF(
-            "SecurityOrchestrator",
-            "ApplyPanelBitCommand: "
-            "SILENCE_ALARM "
-            "area=%d "
-            "bit=%u "
-            "result=%s",
-            area,
-            (unsigned)BITCMD_SILENCE_ALARM,
-            result
-                ? "ACCEPTED"
-                : "FAILED"
-        );
+        if(!result)
+        {
+            LOG_WF(
+                "SecurityOrchestrator",
+                "ApplyPanelBitCommand: SILENCE_ALARM "
+                "area=%d no active alarm",
+                area
+            );
+        }
     }
-
-
-    // ============================================================
-    // AREA HANDLED
-    //
-    // La command area è stata riconosciuta.
-    // SecurityEngine provvederà eventualmente al reset
-    // dell'impulso a zero.
-    //
-    // ============================================================
 
     return true;
 }
@@ -8804,11 +6252,12 @@ public:
     struct ZoneState
     {
         bool valid = false;
-
         size_t index = 0;
-
         const char* name = nullptr;
 
+        int cmdArea = -1;
+
+        bool enabled = false;
         bool alarm = false;
         bool alarmH24 = false;
         bool trouble = false;
@@ -8920,13 +6369,11 @@ public:
         if (sensorIndex >= ws.Count())
             return false;
 
-
         const auto* cfg =
             ws.GetConfig();
 
         if (!cfg)
             return false;
-
 
         Sensor* sensor =
             ws.GetSensor(sensorIndex);
@@ -8934,35 +6381,16 @@ public:
         if (!sensor)
             return false;
 
-
         const auto& c =
             cfg[sensorIndex];
 
-
         out = SensorState{};
-
-        out.valid =
-            true;
-
-        out.index =
-            sensorIndex;
-
-        out.name =
-            c.name;
-
-        out.zone =
-            c.zone;
-
-        out.category =
-            c.category;
-
-        out.cmdArea =
-            c.cmdArea;
-
-
-        // ============================================================
-        // SENSOR STATE
-        // ============================================================
+        out.valid = true;
+        out.index = sensorIndex;
+        out.name = c.name;
+        out.zone = c.zone;
+        out.category = c.category;
+        out.cmdArea = c.cmdArea;
 
         out.enabled =
             sensor->IsEnabled();
@@ -8973,19 +6401,9 @@ public:
         out.engagedH24 =
             sensor->IsEngagedH24();
 
-
-        // ============================================================
-        // FINAL SENSOR OUTPUT
-        // ============================================================
-
         out.alarmOut =
             sensor->Outputs().rt ||
             sensor->Outputs().h24;
-
-
-        // ============================================================
-        // FINAL SENSOR MEMORIES
-        // ============================================================
 
         out.rtMem =
             sensor->Outputs().rtMem;
@@ -8993,24 +6411,16 @@ public:
         out.h24Mem =
             sensor->Outputs().h24Mem;
 
-
-        // ============================================================
-        // CHANNELS
-        // ============================================================
-
         for (size_t i = 0; i < 4; ++i)
         {
             const auto type =
                 static_cast<SensorChannelType>(i);
 
-
             const SensorChannel* ch =
                 sensor->Get(type);
 
-
             if (!ch)
                 continue;
-
 
             out.active[i] =
                 ch->IsActive();
@@ -9022,6 +6432,22 @@ public:
                 ch->IsInhibit();
         }
 
+        if (sensor->IsEnabled())
+        {
+            const bool sensorAnomaly =
+                SecurityOrchestrator::IsSensorAnomaly(
+                    sensorIndex);
+
+            if (sensorAnomaly)
+            {
+                const size_t len =
+                    static_cast<size_t>(
+                        SensorChannelType::LEN);
+
+                out.active[len] = true;
+                out.alarm[len] = true;
+            }
+        }
 
         return true;
     }
@@ -9031,7 +6457,8 @@ public:
     // SENSOR COMMAND
     //
     // bit 0 = ENABLE
-    // bit 1 = ENGAGE
+    // bit 1 = ENGAGE RT
+    // bit 2 = ENGAGE H24
     // ============================================================
 
     bool setSensor(
@@ -9040,19 +6467,17 @@ public:
         bool engageRT,
         bool engageH24)
     {
-        auto& ws =
+        auto& sensors =
             SecurityOrchestrator::getWiredSensors();
 
-        if (sensorIndex >= ws.Count())
+        if (sensorIndex >= sensors.Count())
             return false;
 
-
         const auto* cfg =
-            ws.GetConfig();
+            sensors.GetConfig();
 
         if (!cfg)
             return false;
-
 
         const int area =
             cfg[sensorIndex].cmdArea;
@@ -9060,44 +6485,15 @@ public:
         if (area < 0)
             return false;
 
-
         long value = 0;
 
+        bitWrite(value, 0, enable);
+        bitWrite(value, 1, engageRT);
+        bitWrite(value, 2, engageH24);
 
-        // ------------------------------------------------------------
-        // COMMAND FORMAT
-        // ------------------------------------------------------------
-        //
-        // bit 0 = ENABLE
-        // bit 1 = ENGAGE RT
-        // bit 2 = ENGAGE H24
-        //
-        // ------------------------------------------------------------
-
-        bitWrite(
-            value,
-            0,
-            enable
-        );
-
-        bitWrite(
-            value,
-            1,
-            engageRT
-        );
-
-        bitWrite(
-            value,
-            2,
-            engageH24
-        );
-
-
-        return SecurityOrchestrator::
-            ApplySecurityCommand(
-                area,
-                value
-            );
+        return SecurityOrchestrator::ApplySecurityCommand(
+            area,
+            value);
     }
 
 
@@ -9107,20 +6503,14 @@ public:
     {
         SensorState state;
 
-        if (!getSensorState(
-                sensorIndex,
-                state))
-        {
+        if (!getSensorState(sensorIndex, state))
             return false;
-        }
-
 
         return setSensor(
             sensorIndex,
             enable,
             state.engagedRT,
-            state.engagedH24
-        );
+            state.engagedH24);
     }
 
 
@@ -9130,20 +6520,14 @@ public:
     {
         SensorState state;
 
-        if (!getSensorState(
-                sensorIndex,
-                state))
-        {
+        if (!getSensorState(sensorIndex, state))
             return false;
-        }
-
 
         return setSensor(
             sensorIndex,
             state.enabled,
             engage,
-            state.engagedH24
-        );
+            state.engagedH24);
     }
 
 
@@ -9153,20 +6537,14 @@ public:
     {
         SensorState state;
 
-        if (!getSensorState(
-                sensorIndex,
-                state))
-        {
+        if (!getSensorState(sensorIndex, state))
             return false;
-        }
-
 
         return setSensor(
             sensorIndex,
             state.enabled,
             state.engagedRT,
-            engage
-        );
+            engage);
     }
 
 
@@ -9186,11 +6564,11 @@ public:
         size_t zoneIndex,
         ZoneState& out) const
     {
-        auto& ws =
-            SecurityOrchestrator::getWiredSensors();
+        out = ZoneState{};
 
-        if (zoneIndex >= ws.GetZoneCount())
-            return false;
+        const auto& ws =
+            SecurityOrchestrator::
+                getWiredSensors();
 
         const char* zoneName =
             ws.GetZoneName(zoneIndex);
@@ -9198,81 +6576,181 @@ public:
         if (!zoneName)
             return false;
 
-        const auto& zones =
-            ws.Zones();
-
-        out = ZoneState{};
-
         out.valid = true;
         out.index = zoneIndex;
         out.name = zoneName;
 
+        const auto& zones =
+            ws.Zones();
+
+        out.enabled =
+            zones.IsZoneEnabled(zoneName);
+
         // --------------------------------------------------------
-        // RT
+        // Recupera cmdArea dalla configurazione SecurityZoneConfig
         // --------------------------------------------------------
+
+        const FrontendConfig::Security& cfg =
+            SecurityOrchestrator::getConfig();
+
+        for (size_t i = 0;
+            i < cfg.zoneCount;
+            ++i)
+        {
+            const auto& zoneCfg =
+                cfg.zones[i];
+
+            if (!zoneCfg.name)
+                continue;
+
+            if (strcmp(
+                    zoneCfg.name,
+                    zoneName) == 0)
+            {
+                out.cmdArea =
+                    zoneCfg.cmdArea;
+
+                break;
+            }
+        }
 
         out.alarm =
             zones.ZoneAlarmByType(
                 zoneName,
-                SensorChannelType::RT
-            );
-
-        // --------------------------------------------------------
-        // H24
-        // --------------------------------------------------------
+                SensorChannelType::RT);
 
         out.alarmH24 =
             zones.ZoneAlarmByType(
                 zoneName,
-                SensorChannelType::H24
-            );
-
-        // --------------------------------------------------------
-        // MEMORIA ZONA
-        //
-        // OR delle memorie dei sensori appartenenti alla zona.
-        // --------------------------------------------------------
-
-        const auto& sensors =
-            zones.GetZone(zoneName);
-
-        for (auto* sensor : sensors)
-        {
-            if (!sensor)
-                continue;
-
-            out.rtMem |=
-                sensor->Outputs().rtMem;
-
-            out.h24Mem |=
-                sensor->Outputs().h24Mem;
-        }
-
-        // --------------------------------------------------------
-        // ANOMALIA
-        // --------------------------------------------------------
+                SensorChannelType::H24);
 
         out.trouble =
             DomoManagerAlarmPanel::
                 instance()
                 .getZoneTrouble(
-                    static_cast<int>(zoneIndex)
-                );
-
-        // --------------------------------------------------------
-        // ESCLUSA
-        // --------------------------------------------------------
+                    static_cast<int>(zoneIndex));
 
         out.bypassed =
-            DomoManagerAlarmPanel::
-                instance()
-                .isZoneBypassed(
-                    static_cast<int>(zoneIndex)
-                );
+            !out.enabled;
+
+        const std::vector<Sensor*>& zoneSensors =
+            zones.GetZone(zoneName);
+
+        bool allDisabled =
+            zoneSensors.size() > 0;
+
+        for (Sensor* sensor : zoneSensors)
+        {
+            if (!sensor)
+                continue;
+
+            if (sensor->IsEnabled())
+            {
+                allDisabled = false;
+                break;
+            }
+        }
+
+        if (allDisabled)
+            out.bypassed = true;
+
+        for (Sensor* sensor : zoneSensors)
+        {
+            if (!sensor ||
+                !sensor->IsEnabled())
+            {
+                continue;
+            }
+
+            const Sensor::SensorOutputs& state =
+                sensor->Outputs();
+
+            if (state.rtMem)
+                out.rtMem = true;
+
+            if (state.h24Mem)
+                out.h24Mem = true;
+        }
 
         return true;
     }
 
+
+    // ============================================================
+    // ZONE ENABLE / DISABLE COMMAND
+    //
+    // Il comando arriva dall'HMI tramite cmdArea configurata
+    // in FrontendConfig::Security::zones[].
+    // ============================================================
+
+   bool setZoneEnabled(
+        size_t zoneIndex,
+        bool enable)
+    {
+        const auto& ws =
+            SecurityOrchestrator::
+                getWiredSensors();
+
+        const char* zoneName =
+            ws.GetZoneName(zoneIndex);
+
+        if (!zoneName)
+            return false;
+
+        const FrontendConfig::Security& cfg =
+            SecurityOrchestrator::getConfig();
+
+        for(size_t i = 0;
+            i < cfg.zoneCount;
+            ++i)
+        {
+            const auto& zoneCfg =
+                cfg.zones[i];
+
+            if(!zoneCfg.name)
+                continue;
+
+            if(strcmp(
+                    zoneCfg.name,
+                    zoneName) != 0)
+            {
+                continue;
+            }
+
+            if(zoneCfg.cmdArea < 0)
+                return false;
+
+            return SecurityOrchestrator::
+                ApplySecurityCommand(
+                    zoneCfg.cmdArea,
+                    enable ? 1L : 0L);
+        }
+
+        return false;
+    }
+
+
+    bool disableZone(
+        size_t zoneIndex)
+    {
+        return setZoneEnabled(
+            zoneIndex,
+            false);
+    }
+
+
+    bool enableZone(
+        size_t zoneIndex)
+    {
+        return setZoneEnabled(
+            zoneIndex,
+            true);
+    }
+
+
+    // ============================================================
+    // ZONE BYPASS
+    // ============================================================
 
     bool bypassZone(
         size_t zoneIndex)
@@ -9280,8 +6758,7 @@ public:
         return DomoManagerAlarmPanel::
             instance()
             .bypassZone(
-                static_cast<int>(zoneIndex)
-            );
+                static_cast<int>(zoneIndex));
     }
 
 
@@ -9291,8 +6768,7 @@ public:
         return DomoManagerAlarmPanel::
             instance()
             .clearBypass(
-                static_cast<int>(zoneIndex)
-            );
+                static_cast<int>(zoneIndex));
     }
 
 
@@ -9308,7 +6784,6 @@ public:
             DomoManagerAlarmPanel::instance();
 
         out = PanelState{};
-
         out.valid = true;
 
         out.connected =
@@ -9325,7 +6800,7 @@ public:
 
         out.ready =
             panel.isReady(partition);
-            
+
         out.readyForArm =
             panel.isReadyForArm(partition);
 
@@ -9335,13 +6810,27 @@ public:
         out.globalTamper =
             panel.getGlobalTamper();
 
+        const uint32_t securityMask =
+            static_cast<uint32_t>(
+                SecurityOrchestrator::getSystem()
+                    .getBitmask());
+
+        const bool securityTrouble =
+            (securityMask &
+             (1u <<
+              SecurityOrchestrator::
+                  SystemManager::
+                  GLOBAL_TROUBLE)) != 0;
+
         out.globalTrouble =
-            panel.getGlobalTrouble();
+            panel.getGlobalTrouble() ||
+            securityTrouble;
 
         out.systemBitmask =
             static_cast<uint32_t>(
-                panel.getSystemBitmask()
-            );
+                panel.getSystemBitmask())
+            |
+            securityMask;
 
         out.changeFlags =
             panel.getLastChanges();
@@ -9442,8 +6931,7 @@ public:
                 return commandPanel(
                     AlarmPanelInterface::
                         ArmState::ARMED_AWAY,
-                    partition
-                );
+                    partition);
 
             case SecurityOrchestrator::
                 AlarmPanelCommand::ARM_STAY:
@@ -9451,8 +6939,7 @@ public:
                 return commandPanel(
                     AlarmPanelInterface::
                         ArmState::ARMED_STAY,
-                    partition
-                );
+                    partition);
 
             case SecurityOrchestrator::
                 AlarmPanelCommand::ARM_NIGHT:
@@ -9460,8 +6947,7 @@ public:
                 return commandPanel(
                     AlarmPanelInterface::
                         ArmState::ARMED_NIGHT,
-                    partition
-                );
+                    partition);
 
             case SecurityOrchestrator::
                 AlarmPanelCommand::DISARM:
@@ -9469,8 +6955,7 @@ public:
                 return commandPanel(
                     AlarmPanelInterface::
                         ArmState::DISARMED,
-                    partition
-                );
+                    partition);
 
             default:
                 break;

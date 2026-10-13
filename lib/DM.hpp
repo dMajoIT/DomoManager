@@ -44,62 +44,326 @@ public:
     static void apply(DomoManager& manager, const SplitsConfig& cfg);
 };
 
-class DomoConfigValidator {
+class DomoConfigValidator
+{
 private:
-    static int CalculateMaxAreasFromConfig(const DomoManagerConfig& cfg) {
+
+    // ========================================================================
+    // CALCULATE REQUIRED BUFFER AREAS
+    // ========================================================================
+
+    static int CalculateMaxAreasFromConfig(
+        const DomoManagerConfig& cfg)
+    {
         int maxArea = 0;
-        maxArea = (AreaRegistry::maxValue() > maxArea) ? AreaRegistry::maxValue() : maxArea;
+
+        maxArea =
+            (AreaRegistry::maxValue() > maxArea)
+                ? AreaRegistry::maxValue()
+                : maxArea;
+
+
+        // --------------------------------------------------------------------
+        // MODBUS DEVICES
+        // --------------------------------------------------------------------
 
         for (const auto& d : cfg.devices.list)
-            for (int a : d.areas)
-                if (a > maxArea) maxArea = a;
-
-        for (const auto& a : cfg.areas.list) {
-            if (a.area > maxArea) maxArea = a.area;
-            if (a.forwardArea > maxArea) maxArea = a.forwardArea;
+        {
+            for (int area : d.areas)
+            {
+                if (area > maxArea)
+                    maxArea = area;
+            }
         }
 
-        for (const auto& t : cfg.toggles.list) {
-            if (t.areaRead > maxArea) maxArea = t.areaRead;
-            for (int f : t.forwards)
-                if (f > maxArea) maxArea = f;
+
+        // --------------------------------------------------------------------
+        // BUFFER AREA CONFIGURATION
+        // --------------------------------------------------------------------
+
+        for (const auto& a : cfg.areas.list)
+        {
+            if (a.area > maxArea)
+                maxArea = a.area;
+
+            if (a.forwardArea > maxArea)
+                maxArea = a.forwardArea;
         }
 
-        for (const auto& s : cfg.splits.list) {
-            if (s.mainArea > maxArea) maxArea = s.mainArea;
-            for (int o : s.outAreas)
-                if (o > maxArea) maxArea = o;
+
+        // --------------------------------------------------------------------
+        // TOGGLES
+        // --------------------------------------------------------------------
+
+        for (const auto& t : cfg.toggles.list)
+        {
+            if (t.areaRead > maxArea)
+                maxArea = t.areaRead;
+
+            for (int area : t.forwards)
+            {
+                if (area > maxArea)
+                    maxArea = area;
+            }
         }
+
+
+        // --------------------------------------------------------------------
+        // SPLITS
+        // --------------------------------------------------------------------
+
+        for (const auto& s : cfg.splits.list)
+        {
+            if (s.mainArea > maxArea)
+                maxArea = s.mainArea;
+
+            for (int area : s.outAreas)
+            {
+                if (area > maxArea)
+                    maxArea = area;
+            }
+        }
+
+
+        // --------------------------------------------------------------------
+        // LOCAL INPUTS
+        // --------------------------------------------------------------------
+
+        for (const auto& input : cfg.localIO.inputs)
+        {
+            if (input.area > maxArea)
+                maxArea = input.area;
+        }
+
+
+        // --------------------------------------------------------------------
+        // LOCAL OUTPUTS
+        // --------------------------------------------------------------------
+
+        for (const auto& output : cfg.localIO.outputs)
+        {
+            if (output.area > maxArea)
+                maxArea = output.area;
+        }
+
+
+        // --------------------------------------------------------------------
+        // RESULT
+        //
+        // Area IDs are used as buffer indexes.
+        // For example, maxArea = 223 requires 224 elements.
+        // --------------------------------------------------------------------
 
         return maxArea + 1;
     }
 
-    static bool isAreaKnownInConfig(int area, const DomoManagerConfig& cfg) {
+
+    // ========================================================================
+    // CHECK WHETHER AN AREA IS KNOWN IN CONFIGURATION
+    // ========================================================================
+
+    static bool isAreaKnownInConfig(
+        int area,
+        const DomoManagerConfig& cfg)
+    {
+        if (area < 0)
+            return false;
+
+
+        // --------------------------------------------------------------------
+        // BUFFER AREA CONFIGURATION
+        // --------------------------------------------------------------------
+
         for (const auto& a : cfg.areas.list)
-            if (a.area == area) return true;
+        {
+            if (a.area == area)
+                return true;
+
+            if (a.forwardArea == area)
+                return true;
+        }
+
+
+        // --------------------------------------------------------------------
+        // MODBUS DEVICES
+        // --------------------------------------------------------------------
+
         for (const auto& d : cfg.devices.list)
-            for (int da : d.areas)
-                if (da == area) return true;
+        {
+            for (int deviceArea : d.areas)
+            {
+                if (deviceArea == area)
+                    return true;
+            }
+        }
+
+
+        // --------------------------------------------------------------------
+        // LOCAL INPUTS
+        // --------------------------------------------------------------------
+
+        for (const auto& input : cfg.localIO.inputs)
+        {
+            if (input.area == area)
+                return true;
+        }
+
+
+        // --------------------------------------------------------------------
+        // LOCAL OUTPUTS
+        // --------------------------------------------------------------------
+
+        for (const auto& output : cfg.localIO.outputs)
+        {
+            if (output.area == area)
+                return true;
+        }
+
+
+        // --------------------------------------------------------------------
+        // TOGGLES
+        // --------------------------------------------------------------------
+
+        for (const auto& t : cfg.toggles.list)
+        {
+            if (t.areaRead == area)
+                return true;
+
+            for (int forwardArea : t.forwards)
+            {
+                if (forwardArea == area)
+                    return true;
+            }
+        }
+
+
+        // --------------------------------------------------------------------
+        // SPLITS
+        // --------------------------------------------------------------------
+
+        for (const auto& s : cfg.splits.list)
+        {
+            if (s.mainArea == area)
+                return true;
+
+            for (int outputArea : s.outAreas)
+            {
+                if (outputArea == area)
+                    return true;
+            }
+        }
+
+
+        // --------------------------------------------------------------------
+        // AREA REGISTRY
+        // --------------------------------------------------------------------
+
         for (int i = 0; i < AreaRegistry::count(); ++i)
-            if (AreaRegistry::getValueByIndex(i) == area) return true;
+        {
+            if (AreaRegistry::getValueByIndex(i) == area)
+                return true;
+        }
+
+
         return false;
     }
 
-    static bool validateAreas(const DomoManagerConfig& cfg, DomoManager& DomoManager);
+
+    // ========================================================================
+    // AREA VALIDATION
+    // ========================================================================
+
+    static bool validateAreas(
+        const DomoManagerConfig& cfg,
+        DomoManager& DomoManager);
+
 
 public:
-    enum class StaticValidationResult { OK, WARNING, ERROR };
 
-    static bool validateStatic(const DomoManagerConfig& cfg, DomoManager& DomoManager);
-    static bool validateDynamic(const DomoManagerConfig& cfg, DomoManager& DomoManager);
-    static bool validate(const DomoManagerConfig& cfg, DomoManager& DomoManager);
+    // ========================================================================
+    // VALIDATION RESULT
+    // ========================================================================
+
+    enum class StaticValidationResult
+    {
+        OK,
+        WARNING,
+        ERROR
+    };
+
+
+    // ========================================================================
+    // GENERAL VALIDATION
+    // ========================================================================
+
+    static bool validateStatic(
+        const DomoManagerConfig& cfg,
+        DomoManager& DomoManager);
+
+    static bool validateDynamic(
+        const DomoManagerConfig& cfg,
+        DomoManager& DomoManager);
+
+    static bool validate(
+        const DomoManagerConfig& cfg,
+        DomoManager& DomoManager);
+
+
+    // ========================================================================
+    // AREA VALIDATION
+    // ========================================================================
+
     static bool validateDefineAreas();
-    static bool validateDeviceAreas(const DomoManagerConfig::Devices& cfg, DomoManager& DomoManager);
-    static bool validateDuplicateDeviceAreas(const DomoManagerConfig::Devices& cfg);
-    static bool validateRoutes(const DomoManagerRouteEngine::RoutesConfig& cfg, DomoManager& DomoManager);
-    static bool validateSplits(const DMSplitEngineEx::SplitsConfig& cfg, DomoManager& DomoManager);
-    static bool validateToggles(const DMToggleEngineEx::TogglesConfig& cfg, DomoManager& DomoManager);
-    static int getRequiredAreas(const DomoManagerConfig& cfg) { return CalculateMaxAreasFromConfig(cfg); }
+
+
+    // ========================================================================
+    // DEVICE VALIDATION
+    // ========================================================================
+
+    static bool validateDeviceAreas(
+        const DomoManagerConfig::Devices& cfg,
+        DomoManager& DomoManager);
+
+    static bool validateDuplicateDeviceAreas(
+        const DomoManagerConfig::Devices& cfg);
+
+
+    // ========================================================================
+    // ROUTE VALIDATION
+    // ========================================================================
+
+    static bool validateRoutes(
+        const DomoManagerRouteEngine::RoutesConfig& cfg,
+        DomoManager& DomoManager);
+
+
+    // ========================================================================
+    // SPLIT VALIDATION
+    // ========================================================================
+
+    static bool validateSplits(
+        const DMSplitEngineEx::SplitsConfig& cfg,
+        DomoManager& DomoManager);
+
+
+    // ========================================================================
+    // TOGGLE VALIDATION
+    // ========================================================================
+
+    static bool validateToggles(
+        const DMToggleEngineEx::TogglesConfig& cfg,
+        DomoManager& DomoManager);
+
+
+    // ========================================================================
+    // REQUIRED BUFFER SIZE
+    // ========================================================================
+
+    static int getRequiredAreas(
+        const DomoManagerConfig& cfg)
+    {
+        return CalculateMaxAreasFromConfig(cfg);
+    }
 };
 
 class DomoManager {
@@ -139,6 +403,14 @@ private:
             }
         }
 
+        // Local IO Inputs
+        for (const auto& in : config.localIO.inputs)
+            mappedAreas.insert(in.area);
+
+        // Local IO Outputs
+        for (const auto& out : config.localIO.outputs)
+            mappedAreas.insert(out.area);
+
         std::vector<int> virtualAreas;
         for (int area = 0; area < buffer.size(); ++area) {
             if (!mappedAreas.count(area)) {
@@ -148,29 +420,61 @@ private:
         }
 
         if (!virtualAreas.empty()) {
-            String list;
-            for (int a : virtualAreas)
-                list += String(a) + " ";
-            LOG_IF("InitBuffer", "Auto-detected virtual areas: %s", list.c_str());
+            LOG_IF(
+            "InitBuffer",
+            "Buffer initialized: %u physical areas, %u virtual areas",
+            mappedAreas.size(),
+            virtualAreas.size());
         }
     }
 
-    void mapDevices(const DomoManagerConfig::Devices& cfg) {
-        for (const auto& d : cfg.list) {
+    void mapDevices(const DomoManagerConfig::Devices& cfg)
+    {
+        // ---------------------------------------------------------
+        // Prima aggiungiamo TUTTI i device.
+        // ---------------------------------------------------------
+        for (const auto& d : cfg.list)
+        {
             auto* profile = profiles.get(d.profile.c_str());
-            if (!profile) {
-                LOG_EF("Profilo non trovato: %s", d.profile.c_str());
+
+            if (!profile)
+            {
+                LOG_EF(
+                    "DomoManager",
+                    "Profilo non trovato: %s",
+                    d.profile.c_str());
+
                 continue;
             }
 
             deviceManager.addDeviceManual(
-                d.name.c_str(), d.address, d.slot, *profile,
-                d.areas, d.retry, d.priority);
+                d.name.c_str(),
+                d.address,
+                d.slot,
+                *profile,
+                d.areas,
+                d.retry,
+                d.priority);
+        }
 
-            auto& dev = deviceManager.getDevices().back();
-            dev.GetError().SetStateChangedCallback([this, &dev]() {
-                OnDeviceErrorStateChanged(&dev);
-            });
+        // ---------------------------------------------------------
+        // Solo ora installiamo i callback.
+        //
+        // In questo modo il vector dei device ha già terminato
+        // le eventuali riallocazioni dovute agli addDeviceManual().
+        // ---------------------------------------------------------
+        for (auto& dev : deviceManager.getDevices())
+        {
+            dev.GetError().SetStateChangedCallback(
+                [this, &dev]()
+                {
+                    OnDeviceErrorStateChanged(&dev);
+
+                    // PATCH:
+                    // Propaga immediatamente il cambio di stato
+                    // alla mappa gestita da DMRuntime.
+                    runtime.onDeviceErrorChanged(dev);
+                });
         }
     }
 
@@ -183,7 +487,7 @@ private:
 
         m_leds.set(LedController::FOUR, totalErrors > 0);
         runtime.forceInternalEvent(DeviceManager::AREA_SYSTEM_ERRORS, totalErrors);
-        LOG_IF("DomoManager", "Device error state changed → totalErrors=%d", totalErrors);
+        LOG_DF("DomoManager", "Device error state changed → totalErrors=%d", totalErrors);
     }
 
 public:
@@ -210,6 +514,15 @@ public:
 
     DeviceManager& devices() { return deviceManager; }
     const DeviceManager& devices() const { return deviceManager; }
+
+    // =========================================================
+    // DEVICE ERROR / SECURITY ANOMALY
+    // =========================================================
+
+    bool isAreaInError(int area) const
+    {
+        return runtime.isAreaInError(area);
+    }
 
     bool setup(SomethingChangedFn changed,
                ActivityLoopFn activity,
@@ -510,8 +823,6 @@ inline bool DomoConfigValidator::validateDynamic(const DomoManagerConfig& cfg, D
             ok = false;
             continue;
         }
-        if (buf.IsVirtual(a.area))
-            LOG_WF("Config", "Area %d è virtuale (nessun device la gestisce)", a.area);
     }
 
     for (auto& t : cfg.toggles.list) {

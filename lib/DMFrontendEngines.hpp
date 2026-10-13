@@ -27,6 +27,7 @@
 #include "DMIntrospection.hpp"
 #include "DMIntrusion.hpp"
 #include "DMPlatformNetwork.hpp"
+#include "DMPlatformModbus.hpp"
 
 #define LOG_LEVEL LogLevel::INFO
 #include "DMLogger.hpp"
@@ -472,7 +473,7 @@ public:
     {
         DMPlatform::Network::TCPClient client;
 
-        ModbusTCPClient modbus{
+        DMPlatform::Modbus::TCPClient modbus{
             client
         };
     };
@@ -1855,7 +1856,7 @@ public:
                 continue;
 
 
-            ModbusTCPServer& server =
+            DMPlatform::Modbus::TCPServer& server =
                 _context.modbusServers[client];
 
 
@@ -1867,7 +1868,8 @@ public:
             // ------------------------------------------------
 
             const int result =
-                server.holdingRegisterWrite(
+                DMPlatform::Modbus::serverHoldingRegisterWrite(
+                    server,
                     area,
                     value
                 );
@@ -1994,10 +1996,6 @@ private:
         0;
 
 
-    static constexpr int SOCKET_RESOURCE_MODBUS_BASE =
-        1000;
-
-
     static constexpr int SOCKET_RESOURCE_CLIENT_BASE =
         2000;
 
@@ -2005,8 +2003,6 @@ private:
     // ========================================================
     // RESOURCE STATE
     // ========================================================
-
-    uint8_t _reservedModbusResources = 0;
 
     bool _serverResourceAcquired = false;
 
@@ -2031,7 +2027,7 @@ private:
         > clients;
 
         std::vector<
-            ModbusTCPServer
+            DMPlatform::Modbus::TCPServer
         > modbusServers;
     };
 
@@ -2043,15 +2039,7 @@ private:
     // RESOURCE ID HELPERS
     // ========================================================
 
-    static int modbusResourceId(
-        uint8_t index)
-    {
-        return
-            SOCKET_RESOURCE_MODBUS_BASE +
-            static_cast<int>(index);
-    }
-
-
+    
     static int clientResourceId(
         uint8_t index)
     {
@@ -2118,66 +2106,7 @@ private:
     }
 
 
-    // ========================================================
-    // MODBUS RESOURCE ACQUIRE
-    // ========================================================
-
-    bool acquireModbusSocket(
-        uint8_t index)
-    {
-        if (!_networkManager)
-        {
-            LOG_EF(
-                "HMIEngine",
-                "NetworkManager unavailable"
-            );
-
-            return false;
-        }
-
-
-        if (_socketOwner < 0)
-        {
-            LOG_EF(
-                "HMIEngine",
-                "HMI socket owner unavailable"
-            );
-
-            return false;
-        }
-
-
-        const int resourceId =
-            modbusResourceId(index);
-
-
-        const int slot =
-            _networkManager
-                ->sockets()
-                .acquire(
-                    _socketOwner,
-                    resourceId,
-                    SocketManager::SocketKind::TCP_SERVER
-                );
-
-
-        if (slot < 0)
-        {
-            LOG_WF(
-                "HMIEngine",
-                "HMI Modbus resource unavailable: "
-                "index=%u resource=%d",
-                (unsigned)index,
-                resourceId
-            );
-
-            return false;
-        }
-
-
-        return true;
-    }
-
+  
 
     // ========================================================
     // CLIENT RESOURCE ACQUIRE
@@ -2271,32 +2200,6 @@ private:
             false;
     }
 
-
-    // ========================================================
-    // MODBUS RESOURCE RELEASE
-    // ========================================================
-
-    void releaseModbusSocket(
-        uint8_t index)
-    {
-        if (!_networkManager)
-            return;
-
-
-        if (_socketOwner < 0)
-            return;
-
-
-        _networkManager
-            ->sockets()
-            .release(
-                _socketOwner,
-                modbusResourceId(index),
-                SocketManager::SocketKind::TCP_SERVER
-            );
-    }
-
-
     // ========================================================
     // CLIENT RESOURCE RELEASE
     // ========================================================
@@ -2319,30 +2222,6 @@ private:
                 clientResourceId(index),
                 SocketManager::SocketKind::TCP_CLIENT
             );
-    }
-
-
-    // ========================================================
-    // RELEASE MODBUS RESOURCES
-    // ========================================================
-
-    void releaseModbusResources(
-        uint8_t count)
-    {
-        if (count > _maxClients)
-            count = _maxClients;
-
-
-        for (uint8_t i = 0;
-             i < count;
-             ++i)
-        {
-            releaseModbusSocket(i);
-        }
-
-
-        _reservedModbusResources =
-            0;
     }
 
 
@@ -2370,9 +2249,6 @@ private:
         _serverResourceAcquired =
             false;
 
-
-        _reservedModbusResources =
-            0;
     }
 
 
@@ -2417,10 +2293,12 @@ private:
         if (_context.server == nullptr)
             return;
 
+        DMPlatform::Network::TCPServer* server =
+            _context.server;
 
-        DMPlatform::Network::DestroyTCPServer(
-            _context.server
-        );
+        _context.server = nullptr;
+
+        DMPlatform::Network::DestroyTCPServer(server);
     }
 
 
@@ -2519,7 +2397,7 @@ private:
              i < _maxClients;
              ++i)
         {
-            ModbusTCPServer& server =
+            DMPlatform::Modbus::TCPServer& server =
                 _context.modbusServers[i];
 
 
@@ -2570,11 +2448,10 @@ private:
             // =================================================
 
             const int result =
-                server.configureHoldingRegisters(
+                DMPlatform::Modbus::serverConfigureHoldingRegisters(
+                    server,
                     0,
-                    static_cast<int>(
-                        _registerCount
-                    )
+                    static_cast<int>(_registerCount)
                 );
 
 
@@ -2624,8 +2501,6 @@ private:
     bool SetupServer()
     {
         _activeClients = 0;
-
-        _reservedModbusResources = 0;
 
         _serverResourceAcquired = false;
 
@@ -2681,42 +2556,6 @@ private:
             return false;
         }
 
-
-        // ====================================================
-        // MODBUS LOGICAL RESOURCES
-        // ====================================================
-
-        for (uint8_t i = 0;
-             i < _maxClients;
-             ++i)
-        {
-            if (!acquireModbusSocket(i))
-            {
-                LOG_WF(
-                    "HMIEngine",
-                    "Unable to reserve HMI Modbus resource: "
-                    "index=%u",
-                    (unsigned)i
-                );
-
-
-                releaseModbusResources(
-                    _reservedModbusResources
-                );
-
-
-                destroyServerObject();
-
-                releaseServerSocket();
-
-                return false;
-            }
-
-
-            ++_reservedModbusResources;
-        }
-
-
         // ====================================================
         // MODBUS CONTEXTS
         // ====================================================
@@ -2734,11 +2573,6 @@ private:
             );
 
 
-            releaseModbusResources(
-                _reservedModbusResources
-            );
-
-
             destroyServerObject();
 
             releaseServerSocket();
@@ -2752,13 +2586,7 @@ private:
         // ====================================================
 
         const unsigned socketDemand =
-            1u +
-            (
-                2u *
-                static_cast<unsigned>(
-                    _maxClients
-                )
-            );
+            1u + static_cast<unsigned>(_maxClients);
 
 
         LOG_IF(
@@ -2871,48 +2699,24 @@ private:
             }
 
 
-            // ------------------------------------------------
-            // SocketManager = tracking/resource accounting.
-            //
-            // Preserviamo la semantica originale:
-            // un failure di acquire non forza il disconnect
-            // del TCP client.
-            // ------------------------------------------------
-
-            const bool tracked =
-                acquireClientSocket(i);
-
-
-            if (!tracked)
+            if (!acquireClientSocket(i))
             {
                 LOG_WF(
                     "HMIEngine",
-                    "HMI client %u accepted without "
-                    "SocketManager resource tracking",
+                    "HMI client rejected: no socket resource, "
+                    "client=%u",
                     (unsigned)i
                 );
+
+                DMPlatform::Network::Stop(newClient);
+                return;
             }
 
+            slot = newClient;
 
-            // ------------------------------------------------
-            // Salva il client nello slot stabile.
-            // ------------------------------------------------
-
-            slot =
-                newClient;
-
-
-            // ------------------------------------------------
-            // Associa il client al Modbus context.
-            // ------------------------------------------------
-
-            _context.modbusServers[i].accept(
-                slot
-            );
-
+            _context.modbusServers[i].accept(slot);
 
             ++_activeClients;
-
 
             LOG_IF(
                 "HMIEngine",
@@ -2920,7 +2724,6 @@ private:
                 (unsigned)i,
                 (unsigned)_activeClients
             );
-
 
             return;
         }
@@ -3044,7 +2847,7 @@ private:
                 continue;
 
 
-            ModbusTCPServer& server =
+            DMPlatform::Modbus::TCPServer& server =
                 _context.modbusServers[client];
 
 
@@ -3053,7 +2856,8 @@ private:
                  ++area)
             {
                 const long rawValue =
-                    server.holdingRegisterRead(
+                    DMPlatform::Modbus::serverHoldingRegisterRead(
+                        server,
                         static_cast<int>(area)
                     );
 
@@ -3123,7 +2927,6 @@ public:
           _eventSource(0),
           _networkManager(nullptr),
           _socketOwner(-1),
-          _reservedModbusResources(0),
           _serverResourceAcquired(false),
           _context()
     {
@@ -3197,11 +3000,6 @@ public:
 
         _running =
             false;
-
-
-        _reservedModbusResources =
-            0;
-
 
         _serverResourceAcquired =
             false;
@@ -3463,756 +3261,466 @@ class SecurityEngine
 private:
 
     // ============================================================
-    // LAST ALARM CALLBACK STATE
-    //
-    // La callback viene notificata solo quando cambia lo stato
-    // security osservabile dal frontend.
-    //
-    // ============================================================
-
-    static inline bool alarmCallbackStateValid = false;
-
-    static inline bool lastAlarmEngaged = false;
-    static inline bool lastAlarmActive = false;
-
-    static inline uint64_t lastCurrentAlarmMask = 0;
-    static inline uint64_t lastEffectiveAlarmMask = 0;
-    static inline uint64_t lastSystemBitmask = 0;
-
-
-    // ============================================================
-    // SECURITY ALARM CALLBACK
-    //
-    // Callback verso il frontend.
-    //
-    // SecurityEngine NON conosce relay, sirene o altre uscite.
-    //
-    // Il frontend riceve:
-    //
-    // engaged           = centrale armata
-    // active            = esiste un allarme effettivo
-    // currentAlarmMask  = allarmi attualmente presenti
-    // effectiveAlarmMask= allarmi non silenziati
-    //
+    // ALARM CALLBACK
     // ============================================================
 
     using AlarmCallback =
-        void (*)(
-            bool engaged,
-            bool active,
-            uint64_t currentAlarmMask,
-            uint64_t effectiveAlarmMask,
-            uint64_t systemBitmask
-        );
-
-    static inline AlarmCallback alarmCallback = nullptr;
-
-    static inline bool hmiInitialSyncPending = true;
-    static inline bool reportOnChange = false;
+        void (*)(bool engaged,
+                 bool active,
+                 uint64_t currentAlarmMask,
+                 uint64_t effectiveAlarmMask,
+                 uint64_t systemBitmask);
 
     // ============================================================
-    // INSTANCE / CONTEXT
+    // ALARM CALLBACK STATE
     // ============================================================
 
-    // DomoManager utilizzato dal frontend security per:
-    // - pubblicare gli eventi sull'EventManager
-    // - pubblicare lo stato sulla statusArea
-    static inline DomoManager* manager = nullptr;
-
-
-    // Configurazione security del Frontend.
-    // Contiene:
-    // - configurazione sensori
-    // - statusArea
-    // - panelCommandArea
-    // - eventArea
-    static inline FrontendConfig::Security* config = nullptr;
-
-
-    // Source già registrato dal DomoManagerFrontendEngine
-    // nell'EventManager.
-    //
-    // SECURITY non possiede il source: lo utilizza.
-    static inline uint8_t securitySource = 255;
-
-
-    // Engine inizializzato correttamente.
-    static inline bool initialized = false;
+    struct AlarmCallbackState
+    {
+        AlarmCallback callback;
+        bool valid;
+        bool engaged;
+        bool active;
+        uint64_t currentAlarmMask;
+        uint64_t effectiveAlarmMask;
+        uint64_t systemBitmask;
+    };
 
     // ============================================================
-    // CHANGE FLAGS
-    //
-    // Accumula le variazioni rilevate durante il ciclo security.
-    //
-    // Più flag possono essere attivi contemporaneamente.
+    // ALARM SILENCE STATE
     // ============================================================
 
-    static inline uint8_t changeFlags =
-        SecurityOrchestrator::CHANGE_NONE;
+    struct AlarmSilenceState
+    {
+        bool valid;
+        uint64_t lastMask;
+    };
 
     // ============================================================
-    // SECURITY EVENT ENCODER
-    //
-    // Conversione dell'evento semantico:
-    //
-    // AlarmPanelInterface::Event
-    //
-    // nel formato:
-    //
-    // EventManager::Event
-    //
-    // value:
-    //
-    // bits  0..7   = EventType
-    // bits  8..15  = zone
-    // bits 16..23  = partition
-    //
-    // 0xFF = valore non disponibile (-1)
-    //
-    // description e timestamp restano disponibili nell'eventLog
-    // del DomoManagerAlarmPanel, mentre EventManager trasporta
-    // il codice compatto area/value/source.
+    // CONTEXT
     // ============================================================
 
-    static long EncodeEvent(
-        const AlarmPanelInterface::Event& event)
+    struct Context
+    {
+        DomoManager* manager;
+        FrontendConfig::Security* config;
+        uint8_t securitySource;
+    };
+
+    // ============================================================
+    // RUNTIME
+    // ============================================================
+
+    struct RuntimeState
+    {
+        bool initialized;
+        bool hmiInitialSyncPending;
+        bool reportOnChange;
+        uint8_t changeFlags;
+    };
+
+    // ============================================================
+    // STATIC STATE
+    // ============================================================
+
+    static inline AlarmCallbackState alarmState;
+    static inline AlarmSilenceState silenceState;
+    static inline Context context;
+    static inline RuntimeState runtime;
+
+    // ============================================================
+    // EVENT ENCODER
+    // ============================================================
+
+    static long EncodeEvent(const AlarmPanelInterface::Event& event)
     {
         const uint32_t type =
-            static_cast<uint32_t>(
-                event.type
-            ) & 0xFFu;
-
+            static_cast<uint32_t>(event.type) & 0xFFu;
 
         const uint32_t zone =
             static_cast<uint32_t>(
-                event.zone < 0
-                    ? 0xFF
-                    : event.zone
+                event.zone < 0 ? 0xFF : event.zone
             ) & 0xFFu;
-
 
         const uint32_t partition =
             static_cast<uint32_t>(
-                event.partition < 0
-                    ? 0xFF
-                    : event.partition
+                event.partition < 0 ? 0xFF : event.partition
             ) & 0xFFu;
 
-
-        const uint32_t value =
+        return static_cast<long>(
             type |
             (zone << 8) |
-            (partition << 16);
-
-
-        return static_cast<long>(
-            value
+            (partition << 16)
         );
     }
 
+    // ============================================================
+    // PUBLISH PANEL EVENT
+    // ============================================================
+
+    static void PublishPanelEvent(
+        const AlarmPanelInterface::Event& event,
+        bool alarmEvent)
+    {
+        (void)alarmEvent;
+
+        if(!runtime.initialized ||
+        !context.manager ||
+        !context.config ||
+        context.config->eventArea < 0 ||
+        context.securitySource == 255)
+        {
+            return;
+        }
+
+        const long value =
+            EncodeEvent(event);
+
+        context.manager->getEventManager().push(
+            context.config->eventArea,
+            value,
+            context.securitySource
+        );
+
+        runtime.changeFlags |=
+            SecurityOrchestrator::CHANGE_PANEL;
+    }
 
     // ============================================================
-    // ALARM PANEL EVENT CALLBACK
-    //
-    // Percorso:
-    //
-    // AlarmPanel
-    //      ↓
-    // SecurityEngine
-    //      ↓
-    // EventManager
-    //
-    // SecurityEngine genera l'evento nel sistema frontend.
-    // HMI / AEE / MQTT rimangono consumer separati dell'EventManager.
+    // ALARM PANEL EVENT CALLBACKS
     // ============================================================
 
     static void AlarmPanelAlarmCallback(
         const AlarmPanelInterface::Event& event)
     {
-        if (!initialized)
-            return;
-
-        if (!manager)
-            return;
-
-        if (!config)
-            return;
-
-        if (config->eventArea < 0)
-            return;
-
-        if (securitySource == 255)
-            return;
-
-
-        const long value =
-            EncodeEvent(event);
-
-
-        manager->getEventManager().push(
-            config->eventArea,
-            value,
-            securitySource
-        );
-
-
-        changeFlags |=
-            SecurityOrchestrator::CHANGE_PANEL;
-
-
-        LOG_IF(
-            "SECURITY",
-            "ALARM type=%d alarmType=%d zone=%d partition=%d area=%d value=%ld",
-            static_cast<int>(event.type),
-            static_cast<int>(event.alarmType),
-            event.zone,
-            event.partition,
-            config->eventArea,
-            value
-        );
+        PublishPanelEvent(event, true);
     }
 
     static void AlarmPanelEventCallback(
         const AlarmPanelInterface::Event& event)
     {
-        if (!initialized)
-            return;
-
-        if (!manager)
-            return;
-
-        if (!config)
-            return;
-
-        if (config->eventArea < 0)
-            return;
-
-        if (securitySource == 255)
-            return;
-
-
-        const long value =
-            EncodeEvent(event);
-
-
-        manager->getEventManager().push(
-            config->eventArea,
-            value,
-            securitySource
-        );
-
-
-        changeFlags |=
-            SecurityOrchestrator::CHANGE_PANEL;
-
-
-        LOG_IF(
-            "SECURITY",
-            "EVENT type=%d zone=%d partition=%d area=%d value=%ld",
-            static_cast<int>(event.type),
-            event.zone,
-            event.partition,
-            config->eventArea,
-            value
-        );
+        PublishPanelEvent(event, false);
     }
+
+    // ============================================================
+    // UPDATE SECURITY HMI
+    // ============================================================
 
 
     static void UpdateSecurityHmi(bool force = false)
     {
-        if (!initialized || !config || !manager)
-            return;
-
-
-        const uint8_t changes =
-            changeFlags;
-
-
-        if (changes == SecurityOrchestrator::CHANGE_NONE &&
-            !force)
+        if(!runtime.initialized ||
+        !context.manager ||
+        !context.config)
         {
             return;
         }
 
+        const uint8_t changes =
+            runtime.changeFlags;
+
+        if(!force &&
+        changes == SecurityOrchestrator::CHANGE_NONE)
+        {
+            return;
+        }
+
+        DomoManager* dm =
+            context.manager;
+
+        FrontendConfig::Security* cfg =
+            context.config;
 
         auto& buffer =
-            manager->getBuffer();
+            dm->getBuffer();
 
         auto& hmi =
             SecurityHmiInterface::instance();
 
+        auto& ws =
+            SecurityOrchestrator::getWiredSensors();
 
-        // ============================================================
+        // ========================================================
         // SENSORI
-        // ============================================================
-        //
-        // SENSOR STATUS AREA
-        //
-        // bit  0 = RT active
-        // bit  1 = RT alarm
-        //
-        // bit  2 = H24 active
-        // bit  3 = H24 alarm
-        //
-        // bit  4 = LEN active
-        // bit  5 = LEN alarm
-        //
-        // bit  6 = MASK active
-        // bit  7 = MASK alarm
-        //
-        // bit  8 = RT inhibit
-        // bit  9 = H24 inhibit
-        // bit 10 = LEN inhibit
-        // bit 11 = MASK inhibit
-        //
-        // bit 12 = alarmOut
-        //
-        // bit 13 = ESCLUSO
-        //          true  = sensor disabled
-        //          false = sensor enabled
-        //
-        // bit 14 = RT_MEM
-        // bit 15 = H24_MEM
-        //
-        // ============================================================
+        // ========================================================
 
-        if (force ||
-            (changes &
+        if(force ||
+        (changes &
             (SecurityOrchestrator::CHANGE_SENSOR |
             SecurityOrchestrator::CHANGE_COMMAND)))
         {
-            auto& ws =
-                SecurityOrchestrator::getWiredSensors();
-
-            const auto* cfg =
+            const auto* sensorCfg =
                 ws.GetConfig();
 
-
-            if (cfg)
+            if(sensorCfg)
             {
-                for (size_t i = 0;
-                    i < ws.Count();
-                    ++i)
+                const size_t count =
+                    ws.Count();
+
+                for(size_t i = 0; i < count; ++i)
                 {
                     const int area =
-                        cfg[i].statusArea;
+                        sensorCfg[i].statusArea;
 
-
-                    if (area < 0)
+                    if(area < 0)
                         continue;
-
 
                     SecurityHmiInterface::SensorState state;
 
-
-                    if (!hmi.getSensorState(
-                            i,
-                            state))
-                    {
+                    if(!hmi.getSensorState(i, state))
                         continue;
-                    }
 
+                    uint16_t value = 0;
 
-                    long value = 0;
+                    value |= state.active[0]  ? 0x0001 : 0;
+                    value |= state.active[1]  ? 0x0002 : 0;
+                    value |= state.active[2]  ? 0x0004 : 0;
+                    value |= state.active[3]  ? 0x0008 : 0;
 
+                    value |= state.alarm[0]   ? 0x0010 : 0;
+                    value |= state.alarm[1]   ? 0x0020 : 0;
+                    value |= state.alarm[2]   ? 0x0040 : 0;
+                    value |= state.alarm[3]   ? 0x0080 : 0;
 
-                    // ------------------------------------------------
-                    // CHANNELS
-                    // ------------------------------------------------
+                    value |= state.inhibit[0] ? 0x0100 : 0;
+                    value |= state.inhibit[1] ? 0x0200 : 0;
+                    value |= state.inhibit[2] ? 0x0400 : 0;
+                    value |= state.inhibit[3] ? 0x0800 : 0;
 
-                    for (size_t b = 0;
-                        b < 4;
-                        ++b)
+                    value |= state.alarmOut ? 0x1000 : 0;
+                    value |= !state.enabled  ? 0x2000 : 0;
+                    value |= state.rtMem     ? 0x4000 : 0;
+                    value |= state.h24Mem    ? 0x8000 : 0;
+
+                    if(force ||
+                    buffer.getValueFast(area) !=
+                    static_cast<long>(value))
                     {
-                        bitWrite(
-                            value,
-                            b,
-                            state.active[b]
-                        );
-
-
-                        bitWrite(
-                            value,
-                            4 + b,
-                            state.alarm[b]
-                        );
-
-
-                        bitWrite(
-                            value,
-                            8 + b,
-                            state.inhibit[b]
-                        );
-                    }
-
-
-                    // ------------------------------------------------
-                    // SENSOR ALARM OUTPUT
-                    // ------------------------------------------------
-
-                    bitWrite(
-                        value,
-                        12,
-                        state.alarmOut
-                    );
-
-
-                    // ------------------------------------------------
-                    // SENSOR EXCLUDED
-                    // ------------------------------------------------
-
-                    bitWrite(
-                        value,
-                        13,
-                        !state.enabled
-                    );
-
-
-                    // ------------------------------------------------
-                    // SENSOR MEMORY
-                    // ------------------------------------------------
-
-                    bitWrite(
-                        value,
-                        14,
-                        state.rtMem
-                    );
-
-
-                    bitWrite(
-                        value,
-                        15,
-                        state.h24Mem
-                    );
-
-
-                    // ------------------------------------------------
-                    // WRITE
-                    // ------------------------------------------------
-
-                    if (force ||
-                        buffer.getValueFast(area) != value)
-                    {
-                        manager->forceInternalEvent(
+                        dm->forceInternalEvent(
                             area,
-                            value
+                            static_cast<long>(value)
                         );
                     }
                 }
             }
         }
 
-
-        // ============================================================
+        // ========================================================
         // ZONE
-        // ============================================================
-        //
-        // bit 0 = ALLARME RT
-        // bit 1 = ALLARME H24
-        // bit 2 = ANOMALIA
-        // bit 3 = ESCLUSA
-        // bit 4 = MEM RT
-        // bit 5 = MEM H24
-        //
-        // ============================================================
+        // ========================================================
 
-        if (force ||
-            (changes &
+        if(force ||
+        (changes &
             SecurityOrchestrator::CHANGE_ZONE))
         {
-            auto& ws =
-                SecurityOrchestrator::getWiredSensors();
-
             auto& zones =
                 ws.Zones();
 
+            const size_t zoneCount =
+                ws.GetZoneCount();
 
-            for (size_t i = 0;
-                i < ws.GetZoneCount();
+            for(size_t i = 0;
+                i < zoneCount;
                 ++i)
             {
                 const char* zoneName =
                     ws.GetZoneName(i);
 
-
-                if (!zoneName)
+                if(!zoneName)
                     continue;
-
 
                 const int area =
-                    zones.GetZoneStatusArea(
-                        zoneName
-                    );
+                    zones.GetZoneStatusArea(zoneName);
 
-
-                if (area < 0)
+                if(area < 0)
                     continue;
-
 
                 SecurityHmiInterface::ZoneState state;
 
-
-                if (!hmi.getZoneState(
-                        i,
-                        state))
-                {
+                if(!hmi.getZoneState(i, state))
                     continue;
-                }
 
+                uint16_t value = 0;
 
-                long value = 0;
+                value |= state.alarm    ? 0x0001 : 0;
+                value |= state.alarmH24 ? 0x0002 : 0;
+                value |= state.trouble  ? 0x0004 : 0;
+                value |= state.bypassed ? 0x0008 : 0;
+                value |= state.rtMem    ? 0x0010 : 0;
+                value |= state.h24Mem   ? 0x0020 : 0;
 
-
-                bitWrite(
-                    value,
-                    0,
-                    state.alarm
-                );
-
-
-                bitWrite(
-                    value,
-                    1,
-                    state.alarmH24
-                );
-
-
-                bitWrite(
-                    value,
-                    2,
-                    state.trouble
-                );
-
-
-                bitWrite(
-                    value,
-                    3,
-                    state.bypassed
-                );
-
-
-                bitWrite(
-                    value,
-                    4,
-                    state.rtMem
-                );
-
-
-                bitWrite(
-                    value,
-                    5,
-                    state.h24Mem
-                );
-
-
-                if (force ||
-                    buffer.getValueFast(area) != value)
+                if(force ||
+                buffer.getValueFast(area) !=
+                static_cast<long>(value))
                 {
-                    manager->forceInternalEvent(
+                    dm->forceInternalEvent(
                         area,
+                        static_cast<long>(value)
+                    );
+                }
+            }
+        }
+
+        // ========================================================
+        // SISTEMA / CENTRALE
+        // ========================================================
+
+        if(force ||
+        (changes &
+            (SecurityOrchestrator::CHANGE_SYSTEM |
+            SecurityOrchestrator::CHANGE_PANEL  |
+            SecurityOrchestrator::CHANGE_COMM   |
+            SecurityOrchestrator::CHANGE_COMMAND |
+            SecurityOrchestrator::CHANGE_ZONE   |
+            SecurityOrchestrator::CHANGE_SENSOR)))
+        {
+            SecurityHmiInterface::PanelState state;
+
+            if(!hmi.getPanelState(state, 0))
+                return;
+
+            // ----------------------------------------------------
+            // SYSTEM STATUS
+            // ----------------------------------------------------
+
+            const int statusArea =
+                cfg->statusArea;
+
+            if(statusArea >= 0)
+            {
+                const uint16_t value =
+                    static_cast<uint16_t>(
+                        state.systemBitmask
+                    );
+
+                if(force ||
+                buffer.getValueFast(statusArea) !=
+                static_cast<long>(value))
+                {
+                    dm->forceInternalEvent(
+                        statusArea,
+                        static_cast<long>(value)
+                    );
+                }
+            }
+
+            // ----------------------------------------------------
+            // SYSTEM STATUS 2
+            // ----------------------------------------------------
+
+            const int statusArea2 =
+                cfg->statusArea2;
+
+            if(statusArea2 >= 0)
+            {
+                uint16_t value = 0;
+
+                const bool engaged =
+                    state.armState !=
+                    AlarmPanelInterface::ArmState::DISARMED;
+
+                // ------------------------------------------------
+                // Presenza di una memoria di allarme:
+                // bit 6..11 = memorie centrale
+                // ------------------------------------------------
+
+                const bool alarmMemorized =
+                    (static_cast<uint16_t>(
+                        state.systemBitmask
+                    ) & 0x0FC0u) != 0;
+
+                const bool alarmSilenceAvailable =
+                    engaged &&
+                    alarmMemorized;
+
+                value |= state.connected
+                    ? 0x0001 : 0;
+
+                value |= state.communicationFault
+                    ? 0x0002 : 0;
+
+                value |= state.channelSupervised
+                    ? 0x0004 : 0;
+
+                // bit 3 = PRONTO
+                value |= state.ready
+                    ? 0x0008 : 0;
+
+                // bit 4 = AVARIA
+                value |= state.globalTrouble
+                    ? 0x0010 : 0;
+
+                // bit 5 = PRONTO PER ATTIVAZIONE
+                //
+                // Attivo solo se:
+                // - centrale pronta
+                // - nessuna avaria
+                // - nessun allarme memorizzato
+                value |= (
+                    state.readyForArm &&
+                    state.ready &&
+                    !state.globalTrouble &&
+                    !alarmMemorized
+                )
+                    ? 0x0020 : 0;
+
+                // bit 6 = disponibilità tacitazione allarme
+                value |= alarmSilenceAvailable
+                    ? 0x0040 : 0;
+
+                if(force ||
+                buffer.getValueFast(statusArea2) !=
+                static_cast<long>(value))
+                {
+                    dm->forceInternalEvent(
+                        statusArea2,
+                        static_cast<long>(value)
+                    );
+                }
+            }
+
+            // ----------------------------------------------------
+            // ARM STATE
+            // ----------------------------------------------------
+
+            const int armStateArea =
+                cfg->armStateArea;
+
+            if(armStateArea >= 0)
+            {
+                const long value =
+                    static_cast<long>(
+                        static_cast<uint8_t>(
+                            state.armState
+                        )
+                    );
+
+                if(force ||
+                buffer.getValueFast(armStateArea) !=
+                value)
+                {
+                    dm->forceInternalEvent(
+                        armStateArea,
                         value
                     );
                 }
             }
         }
-
-
-        // ============================================================
-        // SISTEMA / CENTRALE
-        // ============================================================
-        //
-        // WORD 1
-        //
-        // bit  0 = intrusion REALTIME
-        // bit  1 = intrusion H24 REALTIME
-        // bit  2 = flood REALTIME
-        // bit  3 = smoke REALTIME
-        // bit  4 = windows open REALTIME
-        // bit  5 = doors open REALTIME
-        //
-        // bit  6 = intrusion MEM
-        // bit  7 = intrusion H24 MEM
-        // bit  8 = flood MEM
-        // bit  9 = smoke MEM
-        // bit 10 = windows open MEM
-        // bit 11 = doors open MEM
-        //
-        // bit 12 = global tamper
-        //
-        //
-        //
-        // WORD 2
-        //
-        // bit 0 = connected
-        // bit 1 = communication fault
-        // bit 2 = channel supervised
-        // bit 3 = ready
-        // bit 4 = global trouble
-        // bit 5 = ready for arm
-        //
-        //
-        // ARM STATE
-        //
-        // armState viene scritto su una area dedicata.
-        //
-        // ============================================================
-
-        if (force ||
-            (changes &
-            (SecurityOrchestrator::CHANGE_SYSTEM |
-            SecurityOrchestrator::CHANGE_PANEL  |
-            SecurityOrchestrator::CHANGE_COMM   |
-            SecurityOrchestrator::CHANGE_COMMAND)))
-        {
-            SecurityHmiInterface::PanelState state;
-
-
-            if (hmi.getPanelState(
-                    state,
-                    0))
-            {
-                // ========================================================
-                // WORD 1 - SYSTEM
-                // ========================================================
-
-                const int statusArea =
-                    config->statusArea;
-
-
-                if (statusArea >= 0)
-                {
-                    const uint16_t word1 =
-                        static_cast<uint16_t>(
-                            state.systemBitmask
-                        );
-
-
-                    if (force ||
-                        buffer.getValueFast(statusArea) !=
-                            static_cast<long>(word1))
-                    {
-                        manager->forceInternalEvent(
-                            statusArea,
-                            static_cast<long>(word1)
-                        );
-                    }
-                }
-
-
-                // ========================================================
-                // WORD 2 - PANEL STATUS
-                // ========================================================
-
-                const int statusArea2 =
-                    config->statusArea2;
-
-
-                if (statusArea2 >= 0)
-                {
-                    uint16_t word2 = 0;
-
-
-                    bitWrite(
-                        word2,
-                        0,
-                        state.connected
-                    );
-
-
-                    bitWrite(
-                        word2,
-                        1,
-                        state.communicationFault
-                    );
-
-
-                    bitWrite(
-                        word2,
-                        2,
-                        state.channelSupervised
-                    );
-
-
-                    bitWrite(
-                        word2,
-                        3,
-                        state.ready
-                    );
-
-
-                    bitWrite(
-                        word2,
-                        4,
-                        state.globalTrouble
-                    );
-
-
-                    bitWrite(
-                        word2,
-                        5,
-                        state.readyForArm
-                    );
-
-
-                    if (force ||
-                        buffer.getValueFast(statusArea2) !=
-                            static_cast<long>(word2))
-                    {
-                        manager->forceInternalEvent(
-                            statusArea2,
-                            static_cast<long>(word2)
-                        );
-                    }
-                }
-
-
-                // ========================================================
-                // ARM STATE AREA
-                // ========================================================
-
-                const int armStateArea =
-                    config->armStateArea;
-
-
-                if (armStateArea >= 0)
-                {
-                    const long armState =
-                        static_cast<long>(
-                            static_cast<uint8_t>(
-                                state.armState
-                            )
-                        );
-
-
-                    if (force ||
-                        buffer.getValueFast(armStateArea) != armState)
-                    {
-                        manager->forceInternalEvent(
-                            armStateArea,
-                            armState
-                        );
-                    }
-                }
-            }
-        }
     }
+
 
     // ============================================================
     // UPDATE ALARM CALLBACK
-    //
-    // Legge lo stato corrente della centrale e degli allarmi.
-    //
-    // La callback viene chiamata solo se registrata.
-    //
     // ============================================================
 
     static void UpdateAlarmCallback()
     {
+        auto& hmi =
+            SecurityHmiInterface::instance();
+
         SecurityHmiInterface::PanelState panelState;
 
-        auto& hmi = SecurityHmiInterface::instance();
-
-        if (!hmi.getPanelState(panelState, 0))
+        if(!hmi.getPanelState(panelState, 0))
             return;
 
         const bool engaged =
@@ -4220,7 +3728,9 @@ private:
             AlarmPanelInterface::ArmState::DISARMED;
 
         const uint64_t systemBitmask =
-            static_cast<uint64_t>(panelState.systemBitmask);
+            static_cast<uint64_t>(
+                panelState.systemBitmask
+            );
 
         const uint64_t currentAlarmMask =
             SecurityOrchestrator::getCurrentAlarmMask();
@@ -4228,50 +3738,46 @@ private:
         auto& alarmPanel =
             DomoManagerAlarmPanel::instance();
 
-        // Non sincronizzare qui silencedAlarmMask.
-        //
-        // La tacitazione viene gestita da silenceAlarm().
-        // La memoria di tacitazione viene rimossa da
-        // synchronizeAlarmSilence() quando l'allarme non è più presente.
-
         const uint64_t effectiveAlarmMask =
             alarmPanel.getEffectiveAlarmMask();
 
         const bool active =
             effectiveAlarmMask != 0;
 
-        const bool changed =
-            !alarmCallbackStateValid ||
-            engaged != lastAlarmEngaged ||
-            active != lastAlarmActive ||
-            currentAlarmMask != lastCurrentAlarmMask ||
-            effectiveAlarmMask != lastEffectiveAlarmMask ||
-            systemBitmask != lastSystemBitmask;
-
-        if (!changed)
+        if(alarmState.valid &&
+        engaged == alarmState.engaged &&
+        active == alarmState.active &&
+        currentAlarmMask ==
+            alarmState.currentAlarmMask &&
+        effectiveAlarmMask ==
+            alarmState.effectiveAlarmMask &&
+        systemBitmask ==
+            alarmState.systemBitmask)
+        {
             return;
+        }
 
-        lastAlarmEngaged =
+        alarmState.engaged =
             engaged;
 
-        lastAlarmActive =
+        alarmState.active =
             active;
 
-        lastCurrentAlarmMask =
+        alarmState.currentAlarmMask =
             currentAlarmMask;
 
-        lastEffectiveAlarmMask =
+        alarmState.effectiveAlarmMask =
             effectiveAlarmMask;
 
-        lastSystemBitmask =
+        alarmState.systemBitmask =
             systemBitmask;
 
-        alarmCallbackStateValid =
+        alarmState.valid =
             true;
 
-        if (alarmCallback)
+        if(alarmState.callback)
         {
-            alarmCallback(
+            alarmState.callback(
                 engaged,
                 active,
                 currentAlarmMask,
@@ -4279,87 +3785,12 @@ private:
                 systemBitmask
             );
         }
-
-        LOG_IF(
-            "SECURITY",
-            "CALLBACK CALC: "
-            "engaged=%d "
-            "active=%d "
-            "current=0x%016llX "
-            "effective=0x%016llX "
-            "silenced=0x%016llX",
-            engaged ? 1 : 0,
-            active ? 1 : 0,
-            (unsigned long long)currentAlarmMask,
-            (unsigned long long)effectiveAlarmMask,
-            (unsigned long long)alarmPanel.getSilencedAlarmMask()
-        );
     }
-    
 
 public:
-    // ============================================================
-    // SET ALARM CALLBACK
-    //
-    // Il frontend registra qui la propria callback.
-    //
-    // Esempio:
-    //
-    // SecurityEngine::setAlarmCallback(
-    //     SecurityAlarmCallback
-    // );
-    //
-    // ============================================================
-
-    static void setAlarmCallback(
-        AlarmCallback callback)
-    {
-        alarmCallback =
-            callback;
-
-
-        // ------------------------------------------------------------
-        // Una nuova callback deve ricevere il primo stato disponibile.
-        // ------------------------------------------------------------
-
-        alarmCallbackStateValid =
-            false;
-
-
-        lastAlarmEngaged =
-            false;
-
-        lastAlarmActive =
-            false;
-
-        lastCurrentAlarmMask =
-            0;
-
-        lastEffectiveAlarmMask =
-            0;
-
-        lastSystemBitmask =
-            0;
-
-
-        LOG_IF(
-            "SECURITY",
-            "Alarm callback %s",
-            alarmCallback
-                ? "REGISTERED"
-                : "CLEARED"
-        );
-    }
-
 
     // ============================================================
     // SETUP
-    //
-    // Il source SECURITY viene creato dal
-    // DomoManagerFrontendEngine, insieme agli altri source
-    // dell'EventManager.
-    //
-    // SecurityEngine riceve semplicemente il source già creato.
     // ============================================================
 
     static bool Setup(
@@ -4367,102 +3798,156 @@ public:
         FrontendConfig::Security& cfg,
         uint8_t source)
     {
-        manager = &dm;
+        context.manager =
+            &dm;
 
-        config = &cfg;
+        context.config =
+            &cfg;
 
-        securitySource = source;
+        context.securitySource =
+            source;
 
-        initialized = false;
+        runtime.initialized =
+            false;
 
-        hmiInitialSyncPending = true;
+        runtime.hmiInitialSyncPending =
+            true;
 
-        reportOnChange =
+        runtime.reportOnChange =
             cfg.reportOnChange;
 
-        changeFlags =
+        runtime.changeFlags =
             SecurityOrchestrator::CHANGE_NONE;
 
+        alarmState.valid =
+            false;
 
-        // ============================================================
-        // SECURITY DISABLED
-        // ============================================================
+        alarmState.engaged =
+            false;
 
-        if (!cfg.enabled)
-        {
-            LOG_IF(
-                "SECURITY",
-                "Security engine disabled"
-            );
+        alarmState.active =
+            false;
 
+        alarmState.currentAlarmMask =
+            0;
+
+        alarmState.effectiveAlarmMask =
+            0;
+
+        alarmState.systemBitmask =
+            0;
+
+        silenceState.valid =
+            false;
+
+        silenceState.lastMask =
+            0;
+
+        if(!cfg.enabled)
             return false;
-        }
 
-
-        // ============================================================
-        // VALID SOURCE
-        // ============================================================
-
-        if (securitySource == 255)
+        if(source == 255)
         {
             LOG_EF(
                 "SECURITY",
                 "Invalid EventManager source"
             );
-
             return false;
         }
 
+        SecurityOrchestrator::Setup(&cfg);
 
-        // ============================================================
-        // ORCHESTRATOR
-        // ============================================================
+        if(!SecurityOrchestrator::isInitialized())
+        {
+            LOG_EF(
+                "SECURITY",
+                "Security orchestrator initialization failed"
+            );
+            return false;
+        }
 
-        SecurityOrchestrator::Setup(
-            &cfg
+        DMRuntime* runtimeInstance =
+            DMRuntime::GetInstance();
+
+        if(runtimeInstance)
+        {
+            runtimeInstance->SetSecurityAreaErrorCallback(
+                [](int area)
+                {
+                    SecurityEngine::NotifyAreaErrorChanged(area);
+                }
+            );
+        }
+        else
+        {
+            LOG_EF(
+                "SECURITY",
+                "DMRuntime instance not available: "
+                "device error callback NOT registered"
+            );
+        }
+
+        auto& panel =
+            DomoManagerAlarmPanel::instance();
+
+        panel.setAlarmCallback(
+            AlarmPanelAlarmCallback
         );
 
-
-        // ============================================================
-        // ALARM PANEL CALLBACKS
-        // ============================================================
-
-        DomoManagerAlarmPanel::instance()
-            .setAlarmCallback(
-                AlarmPanelAlarmCallback
-            );
-
-
-        DomoManagerAlarmPanel::instance()
-            .setEventCallback(
-                AlarmPanelEventCallback
-            );
-
-
-        // ============================================================
-        // INITIALIZED
-        // ============================================================
-
-        initialized = true;
-
-
-        LOG_IF(
-            "SECURITY",
-            "Security engine initialized "
-            "panelCommandArea=%d "
-            "statusArea=%d "
-            "armStateArea=%d "
-            "eventArea=%d "
-            "source=%d "
-            "reportOnChange=%d",
-            cfg.panelCommandArea,
-            cfg.statusArea,
-            cfg.armStateArea,
-            cfg.eventArea,
-            securitySource,
-            reportOnChange ? 1 : 0
+        panel.setEventCallback(
+            AlarmPanelEventCallback
         );
 
+        runtime.initialized =
+            true;
+
+        return true;
+    }
+
+    // ============================================================
+    // SET ALARM CALLBACK
+    // ============================================================
+
+    static void setAlarmCallback(
+        AlarmCallback callback)
+    {
+        alarmState.callback =
+            callback;
+
+        alarmState.valid =
+            false;
+
+        alarmState.engaged =
+            false;
+
+        alarmState.active =
+            false;
+
+        alarmState.currentAlarmMask =
+            0;
+
+        alarmState.effectiveAlarmMask =
+            0;
+
+        alarmState.systemBitmask =
+            0;
+    }
+
+    // ============================================================
+    // AREA ERROR EVENT
+    // ============================================================
+
+    static bool NotifyAreaErrorChanged(int area)
+    {
+        if(!runtime.initialized || area<0)
+            return false;
+
+        if(!SecurityOrchestrator::NotifyAreaErrorChanged(area))
+            return false;
+
+        runtime.changeFlags |=
+            SecurityOrchestrator::CHANGE_SENSOR |
+            SecurityOrchestrator::CHANGE_ZONE;
 
         return true;
     }
@@ -4470,145 +3955,102 @@ public:
 
     // ============================================================
     // LOOP
-    //
-    // Raccoglie tutti i cambiamenti:
-    //
-    // - reader / sensori
-    // - zone
-    // - stato sistema
-    // - eventi pannello
-    // - comunicazione
-    // - comandi
-    //
-    // Il report viene eseguito una sola volta quando esiste
-    // almeno una variazione.
     // ============================================================
 
     static bool Loop(
         DomoManager& dm,
         unsigned long now)
     {
-        if (!initialized)
-            return false;
-
-        if (!config || !config->enabled)
-            return false;
-
-        if (!dm.getPowerOnCycleCompleted())
-            return false;
-
-
-        // =========================================================
-        // SECURITY ORCHESTRATOR
-        //
-        // Questo è l'UNICO punto in cui viene eseguito Loop().
-        // =========================================================
-
-        const uint8_t changes =
-            SecurityOrchestrator::Loop(now);
-
-        changeFlags |=
-            changes;
-
-
-        DomoManagerAlarmPanel::instance()
-        .synchronizeAlarmSilence(
-            SecurityOrchestrator::getCurrentAlarmMask()
-        );
-
-
-        // =========================================================
-        // HMI
-        //
-        // Prima aggiorniamo la HMI, poi leggiamo PanelState
-        // nel callback.
-        // =========================================================
-
-        const bool forceHmi =
-            hmiInitialSyncPending;
-
-        UpdateSecurityHmi(
-            forceHmi
-        );
-
-        if (forceHmi)
-            hmiInitialSyncPending = false;
-
-
-        // =========================================================
-        // ALARM CALLBACK
-        //
-        // Ora PanelState è aggiornato.
-        // =========================================================
-
-        UpdateAlarmCallback();
-
-
-        // =========================================================
-        // NOTHING CHANGED
-        // =========================================================
-
-        if (changeFlags ==
-            SecurityOrchestrator::CHANGE_NONE)
+        if(!runtime.initialized ||
+        !context.manager ||
+        !context.config ||
+        !context.config->enabled)
         {
             return false;
         }
 
+        if(!dm.getPowerOnCycleCompleted())
+            return false;
 
-        // =========================================================
-        // REPORT
-        // =========================================================
+        const bool alarmEngaged =
+            DomoManagerAlarmPanel::instance()
+                .getArmState(0) !=
+            AlarmPanelInterface::ArmState::DISARMED;
 
-        if (reportOnChange &&
-            (changeFlags &
+        runtime.changeFlags |=
+            SecurityOrchestrator::Loop(
+                now,
+                alarmEngaged
+            );
+
+        const uint64_t currentAlarmMask =
+            SecurityOrchestrator::getCurrentAlarmMask();
+
+        if(!silenceState.valid ||
+        currentAlarmMask !=
+            silenceState.lastMask)
+        {
+            DomoManagerAlarmPanel::instance()
+                .synchronizeAlarmSilence(
+                    currentAlarmMask
+                );
+
+            silenceState.lastMask =
+                currentAlarmMask;
+
+            silenceState.valid =
+                true;
+        }
+
+        const bool forceHmi =
+            runtime.hmiInitialSyncPending;
+
+        const uint8_t changesBeforeHmi =
+            runtime.changeFlags;
+
+        UpdateSecurityHmi(forceHmi);
+
+        if(forceHmi)
+            runtime.hmiInitialSyncPending =
+                false;
+
+        if(forceHmi ||
+        !alarmState.valid ||
+        (changesBeforeHmi &
+            (SecurityOrchestrator::CHANGE_SYSTEM |
+            SecurityOrchestrator::CHANGE_PANEL  |
+            SecurityOrchestrator::CHANGE_COMM   |
+            SecurityOrchestrator::CHANGE_COMMAND |
+            SecurityOrchestrator::CHANGE_ZONE)))
+        {
+            UpdateAlarmCallback();
+        }
+
+        if(runtime.changeFlags ==
+        SecurityOrchestrator::CHANGE_NONE)
+        {
+            return false;
+        }
+
+        if(runtime.reportOnChange &&
+        (runtime.changeFlags &
             (SecurityOrchestrator::CHANGE_ZONE |
             SecurityOrchestrator::CHANGE_SYSTEM |
             SecurityOrchestrator::CHANGE_PANEL |
             SecurityOrchestrator::CHANGE_COMM |
             SecurityOrchestrator::CHANGE_COMMAND)))
         {
-            SecurityOrchestrator::
-                Diagnostic::FullReport();
+            SecurityOrchestrator::Diagnostic::CoreReport();
         }
 
-
-        changeFlags =
+        runtime.changeFlags =
             SecurityOrchestrator::CHANGE_NONE;
-
 
         return true;
     }
 
-
     // ============================================================
-    // FRONTEND COMMAND
-    //
-    // Punto unico di ingresso dei comandi security provenienti
-    // dal frontend.
-    //
-    // Non distingue il chiamante:
-    // HMI / AEE / MQTT devono semplicemente passare:
-    //
-    //     area + value + now
-    //
-    // SecurityEngine stabilisce se l'area appartiene:
-    //
-    // 1) al pannello
-    // 2) a un singolo sensore
-    // 3) a nessun comando security
-    //
-    // ------------------------------------------------------------
-    //
-    // PANEL
-    //     panelCommandArea
-    //          ↓
-    //     ApplyPanelCommand()
-    //
-    // SENSOR
-    //     WiredSensorConfig::cmdArea
-    //          ↓
-    //     ApplySecurityCommand()
-    //
+    // APPLY COMMAND
     // ============================================================
 
     static bool ApplyCommand(
@@ -4616,67 +4058,32 @@ public:
         long value,
         unsigned long now)
     {
-        // ============================================================
-        // ENTRY
-        // ============================================================
+        if (!runtime.initialized ||
+            !context.config ||
+            !context.manager)
+            return false;
 
         LOG_IF(
             "SECURITY",
-            "ApplyCommand ENTRY: "
-            "area=%d value=%ld now=%lu",
+            "ApplyCommand ENTRY: area=%d value=%ld now=%lu",
             area,
             value,
             now
         );
 
-
-        if (!initialized)
-            return false;
-
-
-        if (!config)
-            return false;
-
-
-        // ============================================================
-        // DEBUG CONFIGURATION
-        // ============================================================
-
-        LOG_IF(
-            "SECURITY",
-            "ApplyCommand CHECK: "
-            "area=%d "
-            "value=0x%08lX "
-            "panelCommandArea=%d "
-            "panelBitCommandArea=%d",
-            area,
-            (unsigned long)value,
-            config->panelCommandArea,
-            config->panelBitCommandArea
-        );
-
-
-        // ============================================================
+        // ========================================================
         // PANEL BIT COMMAND
-        //
-        // Area generica a bit.
-        //
-        // Il comando viene elaborato come impulso.
-        // Dopo l'elaborazione il valore dell'area viene riportato
-        // a 0 senza generare un nuovo evento.
-        // ============================================================
+        // ========================================================
 
-        if (config->panelBitCommandArea >= 0 &&
-            area == config->panelBitCommandArea)
+        if (context.config->panelBitCommandArea >= 0 &&
+            area == context.config->panelBitCommandArea)
         {
             LOG_IF(
                 "SECURITY",
-                "PANEL BIT AREA MATCH: "
-                "area=%d value=0x%08lX",
+                "PANEL BIT AREA MATCH: area=%d value=0x%08lX",
                 area,
                 (unsigned long)value
             );
-
 
             const bool handled =
                 SecurityOrchestrator::
@@ -4685,84 +4092,44 @@ public:
                         value
                     );
 
-
             if (handled)
             {
-                changeFlags |=
+                runtime.changeFlags |=
                     SecurityOrchestrator::CHANGE_COMMAND;
 
-
-                LOG_IF(
-                    "SECURITY",
-                    "PANEL BIT CMD: "
-                    "area=%d value=0x%08lX",
-                    area,
-                    (unsigned long)value
-                );
-
-
-                // ----------------------------------------------------
-                // RESET IMPULSO
-                //
-                // Il reset è SILENT:
-                // 1 -> 0 non deve generare un nuovo comando.
-                // ----------------------------------------------------
-
-                if (manager)
-                {
-                    manager->getBuffer().WriteElement(
+                context.manager->getBuffer()
+                    .WriteElement(
                         area,
                         0,
                         false,
                         now
                     );
 
-
-                    LOG_IF(
-                        "SECURITY",
-                        "PANEL BIT CMD RESET: "
-                        "area=%d value=0",
-                        area
-                    );
-                }
-                else
-                {
-                    LOG_EF(
-                        "SECURITY",
-                        "PANEL BIT CMD RESET FAILED: manager=null"
-                    );
-                }
+                LOG_IF(
+                    "SECURITY",
+                    "PANEL BIT CMD RESET: area=%d value=0",
+                    area
+                );
             }
             else
             {
                 LOG_WF(
                     "SECURITY",
-                    "Panel bit command rejected "
-                    "area=%d value=0x%08lX",
+                    "Panel bit command rejected area=%d value=0x%08lX",
                     area,
                     (unsigned long)value
                 );
             }
 
-
-            // L'area è riservata ai panel bit commands.
             return true;
         }
 
-
-        // ============================================================
+        // ========================================================
         // ALARM PANEL COMMAND
-        //
-        // Comando a valore:
-        //
-        // 0 = DISARM
-        // 1 = ARM_AWAY
-        // 2 = ARM_STAY
-        // 3 = ARM_NIGHT
-        // ============================================================
+        // ========================================================
 
-        if (config->panelCommandArea >= 0 &&
-            area == config->panelCommandArea)
+        if (context.config->panelCommandArea >= 0 &&
+            area == context.config->panelCommandArea)
         {
             const bool handled =
                 SecurityOrchestrator::
@@ -4771,12 +4138,10 @@ public:
                         value
                     );
 
-
             if (handled)
             {
-                changeFlags |=
+                runtime.changeFlags |=
                     SecurityOrchestrator::CHANGE_COMMAND;
-
 
                 LOG_IF(
                     "SECURITY",
@@ -4789,22 +4154,18 @@ public:
             {
                 LOG_WF(
                     "SECURITY",
-                    "Panel command rejected "
-                    "area=%d value=%ld",
+                    "Panel command rejected area=%d value=%ld",
                     area,
                     value
                 );
             }
 
-
-            // L'area è riservata al pannello.
             return true;
         }
 
-
-        // ============================================================
+        // ========================================================
         // SINGLE SENSOR
-        // ============================================================
+        // ========================================================
 
         if (SecurityOrchestrator::
                 ApplySecurityCommand(
@@ -4812,9 +4173,11 @@ public:
                     value
                 ))
         {
-            changeFlags |=
-                SecurityOrchestrator::CHANGE_COMMAND;
-
+            runtime.changeFlags|=
+                SecurityOrchestrator::CHANGE_COMMAND|
+                SecurityOrchestrator::CHANGE_SENSOR|
+                SecurityOrchestrator::CHANGE_ZONE|
+                SecurityOrchestrator::CHANGE_SYSTEM;
 
             LOG_IF(
                 "SECURITY",
@@ -4823,18 +4186,15 @@ public:
                 value
             );
 
-
             return true;
         }
 
-
-        // ============================================================
+        // ========================================================
         // NOT A SECURITY COMMAND
-        // ============================================================
+        // ========================================================
 
         return false;
     }
-
 
     // ============================================================
     // DIRECT STATUS ACCESS
@@ -4842,35 +4202,48 @@ public:
 
     static long GetStatus()
     {
-        if (!initialized)
+        if (!runtime.initialized)
             return 0;
-
 
         return SecurityOrchestrator::
             getSystem()
             .getBitmask();
     }
 
-
     // ============================================================
-    // EVENT SOURCE
-    // ============================================================
-
-    static uint8_t getSource()
-    {
-        return securitySource;
-    }
-
-
-    // ============================================================
-    // STATE
+    // ACCESSORS
     // ============================================================
 
     static bool enabled()
     {
-        return initialized &&
-               config &&
-               config->enabled;
+        return runtime.initialized &&
+               context.config &&
+               context.config->enabled;
+    }
+
+    static bool isInitialized()
+    {
+        return runtime.initialized;
+    }
+
+    static uint8_t getChangeFlags()
+    {
+        return runtime.changeFlags;
+    }
+
+    static uint8_t getSource()
+    {
+        return context.securitySource;
+    }
+
+    static DomoManager* getManager()
+    {
+        return context.manager;
+    }
+
+    static FrontendConfig::Security* getConfig()
+    {
+        return context.config;
     }
 };
 

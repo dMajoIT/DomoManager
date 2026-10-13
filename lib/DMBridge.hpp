@@ -724,7 +724,7 @@ protected:
                 const bool hasChanges = reg->hasChanges();
 
                 if (hasChanges) {
-                    LOG_IF("BRIDGE::AEE::PENDING",
+                    LOG_DF("BRIDGE::AEE::PENDING",
                         "AEE pending → hasChanges=1 (now=%lu)", now);
                 }
 

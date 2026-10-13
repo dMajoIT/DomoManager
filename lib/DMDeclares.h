@@ -146,6 +146,73 @@ struct DomoManagerConfig {
         std::vector<Device> list;
     } devices;
 
+    // ========================================================================
+    // LOCAL IO
+    //
+    // Gli I/O fisici vengono gestiti da DomoManager.
+    //
+    // INPUT:
+    //   pin        = pin fisico o identificatore DMPlatform
+    //   area       = area associata all'evento
+    //   invert     = inversione logica dell'ingresso
+    //   debounceMs = tempo di stabilizzazione
+    //
+    // OUTPUT:
+    //   pin        = pin fisico o identificatore DMPlatform
+    //   area       = area associata al comando
+    //
+    // La scansione viene effettuata da DomoManager::Update().
+    // Gli eventi transitano attraverso l'EventManager centrale.
+    // ========================================================================
+
+    struct LocalIO
+    {
+        uint16_t pollingMs = 30;
+
+        // ========================================================================
+        // INPUT
+        // ========================================================================
+
+        struct Input
+        {
+            int pin = -1;
+            int area = -1;
+            uint16_t debounceMs = 10;
+
+            Input(
+                int p = -1,
+                int a = -1,
+                uint16_t debounce = 10)
+                : pin(p),
+                area(a),
+                debounceMs(debounce)
+            {
+            }
+        };
+
+        // ========================================================================
+        // OUTPUT
+        // ========================================================================
+
+        struct Output
+        {
+            int pin = -1;
+            int area = -1;
+
+            Output(
+                int p = -1,
+                int a = -1)
+                : pin(p),
+                area(a)
+            {
+            }
+        };
+
+        std::vector<Input> inputs;
+        std::vector<Output> outputs;
+
+    } localIO;
+
     DomoManagerRouteEngine::RoutesConfig routes;
     DomoManagerBufferEngine::AreasConfig  areas;
     DomoManagerToggleEngine::TogglesConfig toggles;
@@ -392,6 +459,7 @@ struct FrontendConfig {
     {
         const char* name;
         int statusArea = -1;
+        int cmdArea = -1;
     };
 
     struct Security {

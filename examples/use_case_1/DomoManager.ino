@@ -88,7 +88,7 @@ static FrontendConfig mainConfig = [](){
     // CONFIG MQTT NEL FRONTEND
     // ============================================================================
 
-    c.mqtt.enabled = false;
+    c.mqtt.enabled = true;
     c.mqtt.clients = MQTT_CLIENTS;
     c.mqtt.clientCount =
         sizeof(MQTT_CLIENTS) /

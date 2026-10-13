@@ -38,14 +38,16 @@
 
 // ************ IO AREA IDs*******************************
 // 0..9 RESERVED
-DEFINE_AREA(AREA_CAMERA_WIN1_ALM, 13) /////////// Per comodita
-DEFINE_AREA(AREA_CAMERA_WIN2_ALM, 14)
-DEFINE_AREA(AREA_CAMERA_WIN3_ALM, 15)
-DEFINE_AREA(AREA_CUCINA_SMOKE_ALM, 16)
-
 DEFINE_AREA(AREA_PMETER_VOLTAGE, 10)
 DEFINE_AREA(AREA_PMETER_CURRENT, 11)
 DEFINE_AREA(AREA_PMETER_POWER, 12)
+
+DEFINE_AREA(AREA_CAMERA_WIN1_ALM, 13) /////////// Deve essere variato
+DEFINE_AREA(AREA_CAMERA_WIN2_ALM, 14) /////////// Deve essere variato
+DEFINE_AREA(AREA_CAMERA_WIN3_ALM, 15) /////////// Deve essere variato
+DEFINE_AREA(AREA_CUCINA_SMOKE_ALM, 16) /////////// Deve essere variato
+
+
 
 DEFINE_AREA(AREA_CAMERA_PIR_ALM, 23)
 DEFINE_AREA(AREA_CAMERA_PIR_TAMPER, 24)
@@ -131,16 +133,25 @@ DEFINE_AREA(AREA_CAMERA_SECURITY_STATUS, 249)
 DEFINE_AREA(AREA_BAGNO_SECURITY_STATUS, 250)
 DEFINE_AREA(AREA_INGRESSO_SECURITY_STATUS, 251)
 
-DEFINE_AREA(AREA_BAGNO_ESTRATTORE_BIT, 252)
-DEFINE_AREA(AREA_CUCINA_ESTRATTORE_BIT, 253)
-DEFINE_AREA(AREA_MEAN_TEMPS, 254)
-DEFINE_AREA(AREA_MEAN_HUMS, 255)
+DEFINE_AREA(AREA_CUCINA_SECURITY_CMD, 252)
+DEFINE_AREA(AREA_CAMERA_SECURITY_CMD, 253)
+DEFINE_AREA(AREA_BAGNO_SECURITY_CMD, 254)
+DEFINE_AREA(AREA_INGRESSO_SECURITY_CMD, 255)
+
 DEFINE_AREA(AREA_SECURITY_STATUS, 256)
 DEFINE_AREA(AREA_SECURITY_STATUS2, 257)
 DEFINE_AREA(AREA_SECURITY_EVT_AREA, 258)
 DEFINE_AREA(AREA_SECURITY_CMD_AREA, 259)
 DEFINE_AREA(AREA_SECURITY_BIT_AREA, 260)
 
+DEFINE_AREA(AREA_BAGNO_ESTRATTORE_BIT, 261)
+DEFINE_AREA(AREA_CUCINA_ESTRATTORE_BIT, 262)
+DEFINE_AREA(AREA_MEAN_TEMPS, 263)
+DEFINE_AREA(AREA_MEAN_HUMS, 264)
+
+DEFINE_AREA(AREA_MQTT_HANDCONTROL, 265)
+DEFINE_AREA(AREA_MQTT_HANDCONTROL_STATUS, 266)
+DEFINE_AREA(AREA_MQTT_HANDCONTROL_CMD, 267)
 
 // ************ PHISICAL DEVICES *******************************
 IPAddress WaveShareP1_Addr=IPAddress(192, 168, 12, 203);
@@ -172,14 +183,14 @@ static const DomoManagerConfig::Devices mainDevicesConfig = {
           { AREA_INGRESSO_DOOR_ALM, 54, 55, 56, 57, 58, AREA_PLAFONIERA_EXT, 60 },
           3, High
         },
-
+/*
         { "Scheda 4DI+4DO - Quadro P1", WaveShareP1_Addr, 3, "MA01_XACX0440",
           { 62, 63, 64, 65, 66, 67, 68, 69 }, 3, High
-        },
+        },*/
 
         { "Scheda 4DI+4DO - Parete P1", WaveShareP1_Addr, 5, "MA01_XACX0440",
           { 70, 71, 72, 73, 74, 75, 76, 77 }, 3, Medium
-        },
+        }, 
 
         { "Scheda 32DI - Fondo P1", WaveShareP1_Addr, 6, "N4DIH32",
           {
@@ -248,13 +259,33 @@ static const DomoManagerConfig::Devices mainDevicesConfig = {
         },
 
         { "Sensore Light/Temp/Hum - Bagno", WaveSharePT_Addr, 11, "CWT_SLTH_6W_S_C",
-          { 215, 216, 217 }, 3, Low
+          { SENSORE_BAGNO_HUM, SENSORE_BAGNO_TEMP, SENSORE_BAGNO_LUX }, 3, Low
         } 
     }
 };
 
 
-// ************ IO AREAS *******************************
+static const DomoManagerConfig::LocalIO mainLocalIOConfig = {
+    40, // pollingMs
+
+    {
+        // Ingressi: pin, area, invert, debounceMs
+        { DMPlatform::I1, 62, 10 },
+        { DMPlatform::I2, 63, 10 },
+        { DMPlatform::I3, 64, 10 },
+        { DMPlatform::I4, 65, 10 }
+    },
+    {
+        // Uscite: pin, area
+        { DMPlatform::DO4, 66 },
+        { DMPlatform::DO5, 67 },
+        { DMPlatform::DO6, 68 },
+        { DMPlatform::DO7, 69 }
+        
+    }
+};
+
+// ************ MODBUS RTU IO AREAS *******************************
 static const DomoManagerBufferEngine::AreasConfig mainAreasConfig = {
 {
     // --- PARTE 1 ---
@@ -555,7 +586,7 @@ static Watchdog::Params wdConfig = {
     .spikes_window_s   = 45,
     .rate_limit_min_interval = 50,
     .rate_limit_allowed_factor = 2,
-    .update_slow_ms = 110,
+    .update_slow_ms = 130,
     .update_avg_ms  = 90,
     .spikeThresholdFactor_fp = 8 * 256
 };
@@ -716,6 +747,9 @@ DomoManagerConfig makeDomoConfig() {
     // --- Automation JSON ---
     cfg.automation.json = AUTOMATION_JSON;
 
+    // Configura gli I/O locali.
+    cfg.localIO = mainLocalIOConfig;
+ 
     return cfg;
 }
 
@@ -740,140 +774,112 @@ static DomoManagerConfig domoConfig = makeDomoConfig();
 
 static WiredSensorsManager::WiredSensorConfig WIRED_SENSOR_CONFIG[] = {
 
-    // ============================
     // CUCINA
-    // ============================
-
-    // PIR CUCINA
     { "PIR Cucina", "Cucina",
-        {
-            SensorChannel(-1, RT_DELAY, SensorChannelType::RT),
-            SensorChannel(-1, INITIAL_DELAY,      SensorChannelType::H24)
-        },
-        {
-            [](){ return DomoManager::instance->getBuffer().getValueFast(AREA_CUCINA_PIR_ALM) != 0; },
-            [](){ return DomoManager::instance->getBuffer().getValueFast(AREA_CUCINA_PIR_TAMPER) != 0; }
-        },
-        SensorCategory::PIR, AREA_CUCINA_PIR_CMD, AREA_CUCINA_PIR_STATUS
-    },
+      { SensorChannel(-1, RT_DELAY, SensorChannelType::RT),
+        SensorChannel(-1, INITIAL_DELAY, SensorChannelType::H24) },
+      { WiredSensorsManager::MakeReader(AREA_CUCINA_PIR_ALM,
+          [](int area){ return DomoManager::instance->getBuffer().getValueFast(area) != 0; }),
+        WiredSensorsManager::MakeReader(AREA_CUCINA_PIR_TAMPER,
+          [](int area){ return DomoManager::instance->getBuffer().getValueFast(area) != 0; }) },
+      SensorCategory::PIR, AREA_CUCINA_PIR_CMD, AREA_CUCINA_PIR_STATUS },
 
-    // Porta Cucina
-    { "Porta Cucina","Cucina",
-        { SensorChannel(-1, RT_DELAY, SensorChannelType::RT) },
-        {
-            [](){ return DomoManager::instance->getBuffer().getValueFast(AREA_CUCINA_DOOR_ALM) != 0; }
-        },
-        SensorCategory::DOOR, AREA_CUCINA_DOOR_CMD, AREA_CUCINA_DOOR_STATUS
-    },
+    { "Porta Cucina", "Cucina",
+      { SensorChannel(-1, RT_DELAY, SensorChannelType::RT) },
+      { WiredSensorsManager::MakeReader(AREA_CUCINA_DOOR_ALM,
+          [](int area){ return DomoManager::instance->getBuffer().getValueFast(area) != 0; }) },
+      SensorCategory::DOOR, AREA_CUCINA_DOOR_CMD, AREA_CUCINA_DOOR_STATUS },
 
-    // Flood Cucina
     { "Allagamento Cucina", "Cucina",
-        { SensorChannel(-1, RT_DELAY, SensorChannelType::H24) },
-        {
-            [](){ return DomoManager::instance->getBuffer().getValueFast(AREA_CUCINA_FLOOD_ALM) != 0; }
-        },
-        SensorCategory::FLOOD, AREA_CUCINA_FLOOD_CMD, AREA_CUCINA_FLOOD_STATUS
-    },
+      { SensorChannel(-1, RT_DELAY, SensorChannelType::H24) },
+      { WiredSensorsManager::MakeReader(AREA_CUCINA_FLOOD_ALM,
+          [](int area){ return DomoManager::instance->getBuffer().getValueFast(area) != 0; }) },
+      SensorCategory::FLOOD, AREA_CUCINA_FLOOD_CMD, AREA_CUCINA_FLOOD_STATUS },
 
-    // Smoke Cucina
     { "Fumo Cucina", "Cucina",
-        { SensorChannel(-1, RT_DELAY, SensorChannelType::H24) },
-        {
-            [](){ return DomoManager::instance->getBuffer().getValueFast(AREA_CUCINA_SMOKE_ALM) != 0; }
-        },
-        SensorCategory::SMOKE, AREA_CUCINA_SMOKE_CMD, AREA_CUCINA_SMOKE_STATUS
-    },
+      { SensorChannel(-1, RT_DELAY, SensorChannelType::H24) },
+      { WiredSensorsManager::MakeReader(AREA_CUCINA_SMOKE_ALM,
+          [](int area){ return DomoManager::instance->getBuffer().getValueFast(area) != 0; }) },
+      SensorCategory::SMOKE, AREA_CUCINA_SMOKE_CMD, AREA_CUCINA_SMOKE_STATUS },
 
-    // ============================
+
     // CAMERA
-    // ============================
     { "PIR Camera", "Camera",
-        {
-            SensorChannel(-1, RT_DELAY, SensorChannelType::RT),
-            SensorChannel(-1, INITIAL_DELAY,      SensorChannelType::H24)
-        },
-        {
-            [](){ return DomoManager::instance->getBuffer().getValueFast(AREA_CAMERA_PIR_ALM) != 0; },
-            [](){ return DomoManager::instance->getBuffer().getValueFast(AREA_CAMERA_PIR_TAMPER) != 0; }
-        },
-        SensorCategory::PIR, AREA_CAMERA_PIR_CMD, AREA_CAMERA_PIR_STATUS
-    },
+      { SensorChannel(-1, RT_DELAY, SensorChannelType::RT),
+        SensorChannel(-1, INITIAL_DELAY, SensorChannelType::H24) },
+      { WiredSensorsManager::MakeReader(AREA_CAMERA_PIR_ALM,
+          [](int area){ return DomoManager::instance->getBuffer().getValueFast(area) != 0; }),
+        WiredSensorsManager::MakeReader(AREA_CAMERA_PIR_TAMPER,
+          [](int area){ return DomoManager::instance->getBuffer().getValueFast(area) != 0; }) },
+      SensorCategory::PIR, AREA_CAMERA_PIR_CMD, AREA_CAMERA_PIR_STATUS },
 
-    // Finestre Camera
     { "Finestra Camera", "Camera",
-        { SensorChannel(-1, RT_DELAY, SensorChannelType::RT) },
-        {
-            [](){ return DomoManager::instance->getBuffer().getValueFast(AREA_CAMERA_WIN1_ALM) != 0; }
-        },
-        SensorCategory::WINDOW, AREA_CAMERA_WIN1_CMD, AREA_CAMERA_WIN1_STATUS
-    },
+      { SensorChannel(-1, RT_DELAY, SensorChannelType::RT) },
+      { WiredSensorsManager::MakeReader(AREA_CAMERA_WIN1_ALM,
+          [](int area){ return DomoManager::instance->getBuffer().getValueFast(area) != 0; }) },
+      SensorCategory::WINDOW, AREA_CAMERA_WIN1_CMD, AREA_CAMERA_WIN1_STATUS },
 
     { "Vasistas Dx. Camera", "Camera",
-        { SensorChannel(-1, RT_DELAY, SensorChannelType::RT) },
-        {
-            [](){ return DomoManager::instance->getBuffer().getValueFast(AREA_CAMERA_WIN2_ALM) != 0; }
-        },
-        SensorCategory::WINDOW, AREA_CAMERA_WIN2_CMD, AREA_CAMERA_WIN2_STATUS
-    },
+      { SensorChannel(-1, RT_DELAY, SensorChannelType::RT) },
+      { WiredSensorsManager::MakeReader(AREA_CAMERA_WIN2_ALM,
+          [](int area){ return DomoManager::instance->getBuffer().getValueFast(area) != 0; }) },
+      SensorCategory::WINDOW, AREA_CAMERA_WIN2_CMD, AREA_CAMERA_WIN2_STATUS },
 
     { "Vasistas Sx. Camera", "Camera",
-        { SensorChannel(-1, RT_DELAY, SensorChannelType::RT) },
-        {
-            [](){ return DomoManager::instance->getBuffer().getValueFast(AREA_CAMERA_WIN3_ALM) != 0; }
-        },
-        SensorCategory::WINDOW, AREA_CAMERA_WIN3_CMD, AREA_CAMERA_WIN3_STATUS
-    },
+      { SensorChannel(-1, RT_DELAY, SensorChannelType::RT) },
+      { WiredSensorsManager::MakeReader(AREA_CAMERA_WIN3_ALM,
+          [](int area){ return DomoManager::instance->getBuffer().getValueFast(area) != 0; }) },
+      SensorCategory::WINDOW, AREA_CAMERA_WIN3_CMD, AREA_CAMERA_WIN3_STATUS },
 
-    // Smoke Camera
     { "Fumo Camera", "Camera",
-        { SensorChannel(-1, RT_DELAY, SensorChannelType::H24) },
-        {
-            [](){ return DomoManager::instance->getBuffer().getValueFast(AREA_CAMERA_SMOKE_ALM) != 0; }
-        },
-        SensorCategory::SMOKE, AREA_CAMERA_SMOKE_CMD, AREA_CAMERA_SMOKE_STATUS
-    },
+      { SensorChannel(-1, RT_DELAY, SensorChannelType::H24) },
+      { WiredSensorsManager::MakeReader(AREA_CAMERA_SMOKE_ALM,
+          [](int area){ return DomoManager::instance->getBuffer().getValueFast(area) != 0; }) },
+      SensorCategory::SMOKE, AREA_CAMERA_SMOKE_CMD, AREA_CAMERA_SMOKE_STATUS },
 
-    // ============================
+
     // BAGNO
-    // ============================
     { "Allagamento Bagno", "Bagno",
-        { SensorChannel(-1, RT_DELAY, SensorChannelType::H24) },
-        {
-            [](){ return DomoManager::instance->getBuffer().getValueFast(AREA_BAGNO_FLOOD_ALM) != 0; }
-        },
-        SensorCategory::FLOOD, AREA_BAGNO_FLOOD_CMD, AREA_BAGNO_FLOOD_STATUS
-    },
+      { SensorChannel(-1, RT_DELAY, SensorChannelType::H24) },
+      { WiredSensorsManager::MakeReader(AREA_BAGNO_FLOOD_ALM,
+          [](int area){ return DomoManager::instance->getBuffer().getValueFast(area) != 0; }) },
+      SensorCategory::FLOOD, AREA_BAGNO_FLOOD_CMD, AREA_BAGNO_FLOOD_STATUS },
 
     { "PIR Bagno", "Bagno",
-        {
-            SensorChannel(-1, RT_DELAY, SensorChannelType::RT),
-            SensorChannel(-1, INITIAL_DELAY,      SensorChannelType::H24)
-        },
-        {
-            [](){ return DomoManager::instance->getBuffer().getValueFast(AREA_BAGNO_PIR_ALM) != 0; },
-            [](){ return DomoManager::instance->getBuffer().getValueFast(AREA_BAGNO_PIR_TAMPER) != 0; }
-        },
-        SensorCategory::PIR, AREA_BAGNO_PIR_CMD, AREA_BAGNO_PIR_STATUS
-    },
+      { SensorChannel(-1, RT_DELAY, SensorChannelType::RT),
+        SensorChannel(-1, INITIAL_DELAY, SensorChannelType::H24) },
+      { WiredSensorsManager::MakeReader(AREA_BAGNO_PIR_ALM,
+          [](int area){ return DomoManager::instance->getBuffer().getValueFast(area) != 0; }),
+        WiredSensorsManager::MakeReader(AREA_BAGNO_PIR_TAMPER,
+          [](int area){ return DomoManager::instance->getBuffer().getValueFast(area) != 0; }) },
+      SensorCategory::PIR, AREA_BAGNO_PIR_CMD, AREA_BAGNO_PIR_STATUS },
 
-    // ============================
+
     // INGRESSO
-    // ============================
     { "Porta Ingresso", "Ingresso",
-        { SensorChannel(-1, RT_DELAY, SensorChannelType::RT) },
-        {
-            [](){ return DomoManager::instance->getBuffer().getValueFast(AREA_INGRESSO_DOOR_ALM) != 0; }
-        },
-        SensorCategory::DOOR, AREA_INGRESSO_DOOR_CMD, AREA_INGRESSO_DOOR_STATUS
-    }
+      { SensorChannel(-1, RT_DELAY, SensorChannelType::RT) },
+      { WiredSensorsManager::MakeReader(AREA_INGRESSO_DOOR_ALM,
+          [](int area){ return DomoManager::instance->getBuffer().getValueFast(area) != 0; }) },
+      SensorCategory::DOOR, AREA_INGRESSO_DOOR_CMD, AREA_INGRESSO_DOOR_STATUS },
+
+    //Sensore virtuale, pulsante di SOS di un telecomando MQTT
+    {
+    "SOS_Remote",
+    nullptr,                 // nessuna zona
+
+    { SensorChannel( -1, RT_DELAY, SensorChannelType::H24) },
+
+    { WiredSensorsManager::MakeReader(AREA_MQTT_HANDCONTROL,
+            [](int area) { return DomoManager::instance->getBuffer().getValueFast(area) ==6; }) },
+    SensorCategory::PANIC , AREA_MQTT_HANDCONTROL_CMD, AREA_MQTT_HANDCONTROL_STATUS },
 };
 
 static const FrontendConfig::SecurityZoneConfig SECURITY_ZONE_CONFIG[] =
 {
-    { "Cucina",   AREA_CUCINA_SECURITY_STATUS },
-    { "Camera",   AREA_CAMERA_SECURITY_STATUS },
-    { "Bagno",    AREA_BAGNO_SECURITY_STATUS },
-    { "Ingresso", AREA_INGRESSO_SECURITY_STATUS }
+    { "Cucina",   AREA_CUCINA_SECURITY_STATUS, AREA_CUCINA_SECURITY_CMD },
+    { "Camera",   AREA_CAMERA_SECURITY_STATUS, AREA_CAMERA_SECURITY_CMD },
+    { "Bagno",    AREA_BAGNO_SECURITY_STATUS, AREA_BAGNO_SECURITY_CMD },
+    { "Ingresso", AREA_INGRESSO_SECURITY_STATUS, AREA_INGRESSO_SECURITY_CMD }
 };
 
 // ============================================================================
@@ -981,6 +987,21 @@ static constexpr FrontendConfig::MQTT::EnumValue
     { "scene_8",                 17 },
     { "scene_9",                 18 },
     { "scene_10",                19 }
+};
+
+// ============================================================================
+// TUYA TS0215A REMOTE
+// ============================================================================
+
+static constexpr FrontendConfig::MQTT::EnumValue
+    TS0215A_RemoteActions[] =
+{
+    { "disarm",            1 },
+    { "arm_day_zones",     2 },
+    { "arm_night_zones",   3 },
+    { "arm_all_zones",     4 },
+    { "exit_delay",        5 },
+    { "emergency",         6 }
 };
 
 static const FrontendConfig::MQTT::Device
@@ -1203,36 +1224,72 @@ static const FrontendConfig::MQTT::Device
     // TINT 404049D
     // ============================================================================
     {
-    "Telecomando01",
-    "Telecomando Tint 404049D",
+        "Telecomando01",
+        "Telecomando Tint 404049D",
+
+        {
+            {
+                "action",
+                FrontendConfig::MQTT::Mapping::Direction::READ,
+                FrontendConfig::MQTT::Mapping::DataType::ENUM,
+                -1, //Non scrivono nessuna area, passano dalla callback OnMQTTCommand()
+                1.0f,
+                TINT404049D_Actions
+            },
+
+            {
+                "action_group",
+                FrontendConfig::MQTT::Mapping::Direction::READ,
+                FrontendConfig::MQTT::Mapping::DataType::INT,
+                -1, //Non scrivono nessuna area, passano dalla callback OnMQTTCommand()
+                1.0f
+            },
+
+            {
+                "linkquality",
+                FrontendConfig::MQTT::Mapping::Direction::READ,
+                FrontendConfig::MQTT::Mapping::DataType::INT,
+                -1, //Non scrivono nessuna area, passano dalla callback OnMQTTCommand()
+                1.0f
+            }
+        }
+    },
+
+    // ============================================================================
+    // TUYA TS0215A SECURITY REMOTE
+    // ============================================================================
 
     {
-        {
-            "action",
-            FrontendConfig::MQTT::Mapping::Direction::READ,
-            FrontendConfig::MQTT::Mapping::DataType::ENUM,
-            -1, //Non scrivono nessuna area, passano dalla callback OnMQTTCommand()
-            1.0f,
-            TINT404049D_Actions
-        },
+        "TelecomandoAntiF",
+        "Tuya TS0215A Security Remote",
 
         {
-            "action_group",
-            FrontendConfig::MQTT::Mapping::Direction::READ,
-            FrontendConfig::MQTT::Mapping::DataType::INT,
-            -1, //Non scrivono nessuna area, passano dalla callback OnMQTTCommand()
-            1.0f
-        },
+            {
+                "action",
+                FrontendConfig::MQTT::Mapping::Direction::READ,
+                FrontendConfig::MQTT::Mapping::DataType::ENUM,
+                AREA_MQTT_HANDCONTROL, 
+                1.0f,
+                TS0215A_RemoteActions
+            },
 
-        {
-            "linkquality",
-            FrontendConfig::MQTT::Mapping::Direction::READ,
-            FrontendConfig::MQTT::Mapping::DataType::INT,
-            -1, //Non scrivono nessuna area, passano dalla callback OnMQTTCommand()
-            1.0f
+            {
+                "battery",
+                FrontendConfig::MQTT::Mapping::Direction::READ,
+                FrontendConfig::MQTT::Mapping::DataType::INT,
+                -1, // gestito da OnMQTTCommand()
+                1.0f
+            },
+
+            {
+                "linkquality",
+                FrontendConfig::MQTT::Mapping::Direction::READ,
+                FrontendConfig::MQTT::Mapping::DataType::INT,
+                -1, // gestito da OnMQTTCommand()
+                1.0f
+            }
         }
     }
-}
 };
 
 

@@ -3,6 +3,8 @@
 #include <Arduino.h>
 #include <IPAddress.h>
 
+#include "DMPlatform.hpp"
+
 /*
 ===============================================================================
 TEMPORARY ESP32 COMPATIBILITY PATCH - DOMOMANAGER
@@ -136,6 +138,18 @@ This is a temporary library compatibility workaround for the ESP32 port.
 #endif
 
 
+
+
+struct EthernetPins
+{
+    int interruptPin;
+    int mosi;
+    int miso;
+    int sclk;
+    int cs;
+    int reset;
+};
+
 namespace DMPlatform
 {
 namespace Network
@@ -171,23 +185,59 @@ namespace Network
 
 #if defined(ARDUINO_ARCH_ESP32)
 
-    static constexpr int W5500_MISO =
-        12;
+    // ====================================================
+    // BOARD TYPES
+    // ====================================================
 
-    static constexpr int W5500_MOSI =
-        11;
+    #define DM_BOARD_ESP32_S3_ETH                 1
+    #define DM_BOARD_ESP32_S3_POE_ETH_8DI_8RO     2
 
-    static constexpr int W5500_SCLK =
-        13;
+    #ifndef DM_BOARD
 
-    static constexpr int W5500_CS =
-        14;
+        #define DM_BOARD \
+            DM_BOARD_ESP32_S3_ETH
 
-    static constexpr int W5500_RST =
-        9;
+    #endif
 
-    static constexpr int W5500_INT =
-        10;
+    // ====================================================
+    // WAVESHARE ESP32-S3-ETH
+    // ====================================================
+
+    #if DM_BOARD == DM_BOARD_ESP32_S3_ETH
+
+        static constexpr EthernetPins
+            EthernetConfig =
+        {
+            10, // INT
+            11, // MOSI
+            12, // MISO
+            13, // SCLK
+            14, // CS
+             9  // RESET
+        };
+
+    // ====================================================
+    // WAVESHARE ESP32-S3-POE-ETH-8DI-8RO
+    // ====================================================
+
+    #elif DM_BOARD == DM_BOARD_ESP32_S3_POE_ETH_8DI_8RO
+
+        static constexpr EthernetPins
+            EthernetConfig =
+        {
+            12, // ETH_INT
+            13, // ETH_MOSI
+            14, // ETH_MISO
+            15, // ETH_SCLK
+            16, // ETH_CS
+            39  // ETH_RST
+        };
+
+    #else
+
+        #error "Unsupported ESP32 board"
+
+    #endif
 
 #endif
 
@@ -219,13 +269,13 @@ namespace Network
         // ====================================================
 
         pinMode(
-            W5500_RST,
+            EthernetConfig.reset,
             OUTPUT
         );
 
 
         digitalWrite(
-            W5500_RST,
+            EthernetConfig.reset,
             LOW
         );
 
@@ -234,7 +284,7 @@ namespace Network
 
 
         digitalWrite(
-            W5500_RST,
+            EthernetConfig.reset,
             HIGH
         );
 
@@ -255,10 +305,10 @@ namespace Network
         // ====================================================
 
         SPI.begin(
-            W5500_SCLK,
-            W5500_MISO,
-            W5500_MOSI,
-            W5500_CS
+            EthernetConfig.sclk,
+            EthernetConfig.miso,
+            EthernetConfig.mosi,
+            EthernetConfig.cs
         );
 
 
@@ -267,7 +317,7 @@ namespace Network
         // ====================================================
 
         Ethernet.init(
-            W5500_CS
+            EthernetConfig.cs
         );
 
 #endif
@@ -549,13 +599,13 @@ namespace Network
 #if defined(ARDUINO_ARCH_ESP32)
 
         pinMode(
-            W5500_RST,
+            EthernetConfig.reset,
             OUTPUT
         );
 
 
         digitalWrite(
-            W5500_RST,
+            EthernetConfig.reset,
             LOW
         );
 
@@ -564,7 +614,7 @@ namespace Network
 
 
         digitalWrite(
-            W5500_RST,
+            EthernetConfig.reset,
             HIGH
         );
 

@@ -164,7 +164,7 @@ public:
 
             socketAcquired = true;
 
-            LOG_IF(
+            LOG_DF(
                 "UdpAdapter",
                 "UDP socket reserved: slot=%d owner=%d",
                 slot,
@@ -218,7 +218,7 @@ public:
         started = true;
 
 
-        LOG_IF(
+        LOG_DF(
             "UdpAdapter",
             "UDP socket OPEN"
         );
